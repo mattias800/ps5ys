@@ -1885,6 +1885,51 @@ int main() {
               stats.misses == 1 && stats.hits == 1,
           "identical vertex prolog/main pairs share one compiled cache entry");
 
+    // The factory returns an unfinished key: chained vertices, like ordinary graphics and compute,
+    // attach the diagnostic address before hashing it. Relocated identical prologs must separate
+    // while a selector is armed, and each finalized key must remain reusable in either call order.
+    {
+        const std::vector<uint32_t> relocated_prolog(
+            vertex_prolog, vertex_prolog + std::size(vertex_prolog));
+        char selector[32];
+        std::snprintf(selector, sizeof selector, "0x%llx",
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(vertex_prolog)));
+        set_test_env("PROSPER_CFG_TRIP_BOUND", "4");
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", selector);
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        for (bool relocated_first : {false, true}) {
+            clear_shader_recompile_cache();
+            const uint32_t* first = relocated_first ? relocated_prolog.data() : vertex_prolog;
+            const uint32_t* second = relocated_first ? vertex_prolog : relocated_prolog.data();
+            uint64_t first_id = 0, second_id = 0, repeated_id = 0;
+            const auto first_words = recompile_vertex_chain_cached_shared(
+                first, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+                &table, nullptr, &first_id);
+            const auto second_words = recompile_vertex_chain_cached_shared(
+                second, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+                &table, nullptr, &second_id);
+            const auto repeated_words = recompile_vertex_chain_cached_shared(
+                first, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+                &table, nullptr, &repeated_id);
+            const auto selected_stats = shader_recompile_cache_stats();
+            CHECK(first_words && second_words && !first_words->empty() && !second_words->empty() &&
+                      first_id != 0 && second_id != 0 && first_id != second_id &&
+                      repeated_words == first_words && repeated_id == first_id &&
+                      selected_stats.misses == 2 && selected_stats.hits == 1,
+                  "armed chained-vertex keys separate addresses and hit after finalization");
+        }
+        set_test_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        set_test_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
+        // Restore the ordinary pair for the LDS and code-mutation arms below.
+        clear_shader_recompile_cache();
+        (void)recompile_vertex_chain_cached_shared(
+            vertex_prolog, std::size(vertex_prolog), chain_main.data(), chain_main.size(),
+            &table, nullptr, &chain_first_identity);
+        stats = shader_recompile_cache_stats();
+    }
+
     const uint64_t pre_lds_misses = stats.misses;
     uint64_t chain_lds_identity = 0;
     const SharedShaderWords chain_with_lds = recompile_vertex_chain_cached_shared(
