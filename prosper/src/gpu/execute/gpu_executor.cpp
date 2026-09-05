@@ -1692,7 +1692,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             key.resources.push_back(compiled);
         }
     }
-    key.cached_hash = ShaderCompileKeyHash::compute(key);
+    // All three callers still attach their program's trip-bound settings. Hash only after that
+    // finalization: a provisional hash here is unconditionally overwritten before any cache lookup.
     return key;
 }
 
@@ -2183,7 +2184,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     // Only meaningful while the trip-bound diagnostic is armed; disarmed it leaves the key exactly as
     // it was. The program address is carried on the diagnostic context because nothing else in the
     // key identifies WHICH program these code bytes belong to, and that is precisely the distinction
-    // the selector makes. Recompute the hash: make_shader_compile_key already cached one.
+    // the selector makes. Finalize the hash only after attaching those diagnostic settings.
     key.trip_bound = compute_trip_bound_settings();
     if (key.trip_bound.bound) key.trip_bound_program_address = diagnostic.program_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);

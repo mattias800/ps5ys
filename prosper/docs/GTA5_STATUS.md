@@ -30,6 +30,28 @@ an overall **~34x speedup** (measured across 106 rendered frames in 4.90 s; Run 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## Linux windowed baseline (2026-09-06, #3065)
+
+At `a5150495e`, a fresh Release build with `-O3 -DNDEBUG -g1 -fno-omit-frame-pointer`
+reached the bank gameplay scene on the unchanged `reach-performance-story.pad` route. Both save
+roots were fresh. Frontend screenshots confirmed **Graphics Mode: Performance** and subsequently
+the bank interior, characters, radar and walking tutorial. The nine-minute run used native rendering,
+full cadence, immediate presentation, default cache/worker settings and no diagnostic compute skips;
+the app confirmed the renderer's shared present queue. No device-loss signal was recorded.
+
+The native Linux/RADV F8 window measured **5.58 guest flips/s and 5.78 host presents/s** over
+5.02 seconds, with 1.51 process CPU cores. Its 720 renderer and 1,917 compute detail records were
+not truncated. Measured totals were 2,311 ms graphics and 1,547 ms compute; resource preparation
+accounted for 1,179 ms across its frontend/backend layers. These are scoped timing records, not an
+exhaustive GPU frame budget. The later F9 bundle completed with 73 submits and a matching frontend
+gameplay image, outside the timed window. Artifact hashes and capture details belong to #3065.
+
+A separate 20-second CPU profile retained 1,607 samples with zero reported loss. Compiled-key hashing
+was 5.91% of **sampled** CPU; this is not a share of frame time or a promised speedup. Inspection found
+that `make_shader_compile_key` computed a provisional hash which all three callers unconditionally
+overwrote after attaching diagnostic settings. Removing that first calculation preserves the final key,
+equality checks and shader output. End-to-end performance improvement is not yet established.
+
 ## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.
