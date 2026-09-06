@@ -31,11 +31,14 @@ and reviewers know what the invariants are.
   then faults on a page the probe just called fine — the guest module's own `.text`/`.rodata` are large
   read-only mappings in the same address space. That was a real defect in #1637 as merged, fixed by
   #1654.
-  **Cost, and what to do on a hot path:** `guest_writable` is **uncached**, and on Linux it `fopen`s
-  and parses `/proc/self/maps` on **every** call — unlike `guest_readable`, which has a thread-local
-  range cache. So it must not be dropped into a per-draw path. Do **not** resolve that by switching
-  back to `guest_readable` (wrong predicate, above — and its cache consults `submit_ranges` only
-  inside a renderer submit scope, which the DCB-build path is not). Prefer an **arithmetic answer to
+  **Cost, and what to do on a hot path:** `guest_writable` has a separate thread-local positive
+  range cache, invalidated by the mapping/protection generation (#2387/#2389). On supporting Linux
+  kernels, misses query exact covering writable VMAs using `PROCMAP_QUERY` (#3398); unavailable
+  interfaces retain textual `/proc/self/maps` enumeration. Adjacent VMAs must cover the entire
+  request, with no read-only region or hole, and only a complete positive query may populate the
+  cache. The generation is captured **before** the evidence it tags. Neither route supplies a
+  lifetime guarantee or an atomic multi-VMA snapshot. Do **not** replace it with `guest_readable`
+  (wrong predicate, above). Prefer an **arithmetic answer to
   the question actually being asked**: `hle_agc.cpp`'s DCB ring registry (#1650) remembers the
   `[bottom, top)` extent each command packet was built into, so a patcher validates the pointer the
   guest hands back by range compare, and only misses fall through to the probe. Structure such a cache
