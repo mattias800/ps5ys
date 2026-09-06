@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-06
 
+### Thirty-one cores watched one core convert a 4K video frame
+
+The intro's largest single cost turned out to be a per-texel conversion loop running on one core out
+of thirty-two — and the helper that spreads exactly this kind of loop across cores was already in the
+same file, used thirteen times elsewhere and once inside this very chain, just never applied to these
+six. Wiring them up halves the compute time, and giving the texture staging copy the same treatment
+takes the intro from 3.6 to 4.7 fps on top of the mapping fix below. Still six times slower than it
+needs to be, for a reason that is architectural rather than a missed optimisation:
+[#3407](https://github.com/mattias800/prosper/issues/3407).
+
 ### Sonic Frontiers got faster, and the GPU was never the problem
 
 At 3.3 fps the GPU was busy **5.4%** of the time — it was idle, waiting for us. Nearly a third of
