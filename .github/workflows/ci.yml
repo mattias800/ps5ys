@@ -30,6 +30,29 @@ jobs:
       - name: Verify host code and sanitizer positive controls
         run: ctest --test-dir prosper/build-sanitizers --no-tests=error --output-on-failure
 
+  host-tsan:
+    # DEBUGGING_WORKFLOWS.md states that BOTH sanitizer configurations must pass. The thread
+    # configuration is the one that rots quietly -- its race control was already flaky under
+    # optimization once -- so the claim is pinned here rather than left to local runs.
+    name: Host TSan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ ninja-build
+      - name: Build isolated host checks
+        run: |
+          mkdir -p prosper/build-tsan/tmpdir
+          export TMPDIR="$PWD/prosper/build-tsan/tmpdir"
+          cmake -S prosper/tools/doctor -B prosper/build-tsan -G Ninja \
+            -DPROSPER_SANITIZER=thread
+          cmake --build prosper/build-tsan -j2
+      - name: Verify host code and race-detection positive control
+        run: ctest --test-dir prosper/build-tsan --no-tests=error --output-on-failure
+
   linux:
     name: Linux
     runs-on: ubuntu-latest

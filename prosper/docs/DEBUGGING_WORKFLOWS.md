@@ -10,13 +10,18 @@ Read the title/area's **Ruled out** section before starting an investigation.
 ```bash
 python3 tools/doctor/doctor.py
 # These controls touch only their own children; output must be a NEW directory.
-python3 tools/doctor/doctor.py --probe perf --probe debugger \
+python3 tools/doctor/doctor.py --probe perf --probe perf-kernel --probe debugger \
     --output build-linux/doctor-first --json
 ```
 
 `INSTALLED` is inventory. `READY` requires the control's expected observation. Exit 1 means a
 requested capability was unavailable; read `report.json` and the command logs, not an empty
-histogram. The perf control requires both user and kernel samples. The separate scheduler control
+histogram. **Ask only for the capability you need, because they fail separately.**
+`--probe perf` is user-space sampling — what the `perf record -g -p` recipe below actually uses —
+and `--probe perf-kernel` is kernel sampling, which `kernel.perf_event_paranoid=2` denies on its
+own while leaving user-space sampling working. Asking for both on such a host is correct and
+returns one READY and one UNAVAILABLE; asking for kernel sampling you do not need turns a usable
+host into exit 1. The separate scheduler control
 below requires both switch and wakeup events from an explicitly system-wide recording.
 The debugger control attaches only
 to its own child; it does **not** certify access across a container boundary or to an existing game.
@@ -200,7 +205,8 @@ ctest --test-dir build-tsan --no-tests=error --output-on-failure
 ```
 
 Both configurations must pass the clean control and detect their deliberately faulty controls
-with the expected diagnostic. A runtime initialization failure is not a detected race.
+with the expected diagnostic, and both are pinned in CI (`host-sanitizers`, `host-tsan`) so that
+requirement cannot quietly stop being true. A runtime initialization failure is not a detected race.
 Fedora GCC needs `libasan libubsan libtsan` in the build container. All six registered tests
 must execute. `PROSPER_SANITIZER=none` is available for an uninstrumented comparison; it omits
 the instrument control and must not be described as sanitizer validation.

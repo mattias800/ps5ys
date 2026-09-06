@@ -6,10 +6,14 @@ import sys
 
 
 def main():
-    binary, mode = sys.argv[1:]
     cases = {"address-undefined": [("address", "AddressSanitizer: heap-buffer-overflow"),
                                    ("undefined", "runtime error: signed integer overflow")],
              "thread": [("thread", "ThreadSanitizer: data race")]}
+    # A checker whose own misuse is a traceback teaches the reader nothing. Fail like a tool.
+    if len(sys.argv) != 3 or sys.argv[2] not in cases:
+        print(f"usage: {sys.argv[0]} BINARY {{{'|'.join(cases)}}}")
+        return 2
+    binary, mode = sys.argv[1:]
     env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1",
            "UBSAN_OPTIONS": "halt_on_error=1", "TSAN_OPTIONS": "halt_on_error=1"}
     for arm, signature in [("clean", "SANITIZER_CONTROL_CLEAN"), *cases[mode]]:

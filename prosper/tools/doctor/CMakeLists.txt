@@ -36,6 +36,11 @@ function(host_test name)
   set_tests_properties(${name} PROPERTIES TIMEOUT 30)
 endfunction()
 # Existing production sources and existing regression arms, without guest execution or Vulkan.
+# These pairs are listed BY HAND on purpose: this build is deliberately narrow, so it cannot
+# reuse the main tree's `file(GLOB_RECURSE ... src/*.cpp)`. The cost lands on someone else --
+# splitting any source below into a second .cpp reddens the `Host ASan + UBSan` CI job in an
+# unrelated PR. If that is you: add the new source to the same host_test() line. Nothing here
+# is title- or dump-specific, so a link error is a stale list and never a missing fixture.
 host_test(self_segment_key "${PROSPER_ROOT}/tests/test_self_segment_key.cpp"
                           "${PROSPER_ROOT}/src/self/module.cpp")
 host_test(rdna2_decode "${PROSPER_ROOT}/tests/gpu/recompiler/test_rdna2_decode.cpp"

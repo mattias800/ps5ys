@@ -27,7 +27,8 @@ For memory and concurrency diagnostics, the standalone [host sanitizer suite](DE
 builds SELF parsing, RDNA2 decoding, BC decoding and submit-gate tests directly against production
 sources. ASan/UBSan and TSan configurations include clean and deliberately faulty instrument controls;
 a missing runtime or initialization failure cannot count as bug detection. The `host-sanitizers`
-CI job runs ASan/UBSan. This is focused host coverage, not sanitized guest execution.
+and `host-tsan` CI jobs run those two configurations. This is focused host coverage, not sanitized
+guest execution.
 
 ## 2. Render → readback → pixel/region assertions
 
