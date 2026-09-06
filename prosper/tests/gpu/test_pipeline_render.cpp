@@ -9,7 +9,23 @@
 // by resolve_pipeline_state from a real register value — not hand-set — so this exercises the whole path.
 #include "gpu/state/render_state.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include <vulkan/vulkan.h>
+
+// Pixels cannot reveal whether the driver received reusable compilation data. Observe the real
+// API boundary while still executing every pipeline creation on the device.
+static unsigned driver_cache_calls = 0;
+static bool driver_cache_missing = false;
+static VkResult observe_graphics_pipeline_cache(
+    VkDevice device, VkPipelineCache cache, uint32_t count,
+    const VkGraphicsPipelineCreateInfo* info, const VkAllocationCallbacks* allocator,
+    VkPipeline* pipelines) {
+    ++driver_cache_calls;
+    driver_cache_missing |= cache == VK_NULL_HANDLE;
+    return vkCreateGraphicsPipelines(device, cache, count, info, allocator, pipelines);
+}
+#define vkCreateGraphicsPipelines observe_graphics_pipeline_cache
 #include "fixtures/render_runner.h"
+#undef vkCreateGraphicsPipelines
 #include "fixtures/spirv_triangle.h"
 #include <cstdio>
 #include <cstring>
@@ -260,6 +276,8 @@ int main() {
         } else { CHECK(false, "FACE=1 cull render produced a frame"); }
     }
 
+    CHECK(driver_cache_calls > 1 && !driver_cache_missing,
+          "distinct graphics pipelines receive the device's driver compilation cache");
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

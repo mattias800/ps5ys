@@ -1049,6 +1049,9 @@ struct RenderVkCtx {
     // Non-null only under PROSPER_VK_VALIDATION; without it the layer has no output sink.
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
+    // Driver compilation data, distinct from the map retaining prosper's VkPipeline handles.
+    // Retained with this process-lifetime device. All users hold BackendPersistentResourceGuard.
+    VkPipelineCache driver_pipeline_cache = VK_NULL_HANDLE;
     VkDeviceSize storage_buffer_alignment = 1;
     double timestamp_period_ns = 0.0;
     uint32_t timestamp_valid_bits = 0;
@@ -1493,6 +1496,14 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        const VkResult cache_result = vkCreatePipelineCache(
+            r.dev, &cache_info, nullptr, &r.driver_pipeline_cache);
+        if (cache_result != VK_SUCCESS) {
+            r.driver_pipeline_cache = VK_NULL_HANDLE;
+            fprintf(stderr, "[render] driver pipeline cache unavailable (%d); compiling uncached\n",
+                    static_cast<int>(cache_result));
+        }
         vkGetDeviceQueue(r.dev, r.qfi, 0, &r.queue);
         // Present unification (#1270): resolve the queue prosper-app will use to present. A dedicated
         // second queue (when the family has >=2) avoids contending the render queue; otherwise the app
@@ -8653,7 +8664,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 fflush(stderr);
             }
             const VkResult pipeline_result = vkCreateGraphicsPipelines(
-                    dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe);
+                    dev, ctx.driver_pipeline_cache, 1, &gp, nullptr, &v.pipe);
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-pipeline end result=%d pipeline=%p\n",
