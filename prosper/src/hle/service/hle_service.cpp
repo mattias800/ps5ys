@@ -2950,7 +2950,7 @@ std::atomic<int32_t> g_npweb_user_context_id{1001};
 }
 HLE(s_net_pool_create) {
     svc_log("sceNetPoolCreate", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a0) || (int32_t)a1 <= 0) return 0x80410118ull; // SCE_NET_ERROR_ENFILE
+    if (!svc_ptrish(a0) || (int32_t)a1 <= 0) return 0x80410116ull; // SCE_NET_ERROR_EINVAL (0x80410100 | BSD EINVAL 22, #3300)
     return (uint64_t)(uint32_t)g_net_pool_id.fetch_add(1);
 }
 HLE(s_ssl_init) {

@@ -68,6 +68,24 @@ int main() {
         if (v != 1) { printf("  [FAIL] __ctype_get_mb_cur_max returned %llu, want 1 (the value, not a pointer)\n", (unsigned long long)v); fails++; }
     } else { printf("  [FAIL] not registered: __ctype_get_mb_cur_max\n"); fails++; }
 
+    // sceNetPoolCreate returns SCE_NET_ERROR_EINVAL (0x80410116 = 0x80410100 | BSD EINVAL 22) on
+    // invalid arguments, and a positive pool ID on valid arguments (#3300).
+    if (HleFn fn = Hle::lookup(nid_hash("sceNetPoolCreate"))) {
+        uint64_t err = fn(0, 0, 0, 0, 0, 0);
+        if (err != 0x80410116ull) {
+            printf("  [FAIL] sceNetPoolCreate(0, 0) returned 0x%llx, want 0x80410116 (SCE_NET_ERROR_EINVAL)\n",
+                   (unsigned long long)err);
+            fails++;
+        }
+        char dummy[16] = "testpool";
+        uint64_t id = fn((uint64_t)(uintptr_t)dummy, 4096, 0, 0, 0, 0);
+        if (id == 0 || (int32_t)id <= 0) {
+            printf("  [FAIL] sceNetPoolCreate valid call returned non-positive id %lld\n",
+                   (long long)(int32_t)id);
+            fails++;
+        }
+    } else { printf("  [FAIL] not registered: sceNetPoolCreate\n"); fails++; }
+
     // Sony's Dinkumware inline isspace uses (_Getpctype()[c] & 0x144), not the
     // incompatible MSVCRT bit layout. Pin representative C-locale masks and EOF/case slots.
     if (HleFn fn = Hle::lookup(nid_hash("_Getpctype"))) {
