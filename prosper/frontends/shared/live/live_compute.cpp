@@ -961,6 +961,13 @@ struct ComputeImageCacheKey {
     // one-level image to a binding whose module fetches level three is not a miss but a fault.
     // Appended LAST so `storage_image_cache_key`'s positional aggregate init keeps its meaning.
     uint32_t mip_levels = 1;
+    // Renderer-owned sampled surfaces are not guest-backed: their bytes arrive as a published
+    // `LiveTargetSnapshot::pixels` buffer, so `gpu_addr` alone does not identify what this image
+    // holds -- the same address published in a different pixel format converts differently. This
+    // is `live_target.format + 1` for that class and 0 for every guest-backed key, so it both
+    // captures the conversion's source dependency and keeps the two classes from colliding on one
+    // address. Appended after `mip_levels` for the same positional-init reason.
+    uint32_t renderer_source_format = 0;
 
     bool operator==(const ComputeImageCacheKey& other) const = default;
 };
@@ -979,7 +986,7 @@ struct ComputeImageCacheKeyHash {
         mix(key.mip_tail_offset); mix(key.mip_tail_bytes);
         mix(key.mip_tail_x); mix(key.mip_tail_y); mix(key.vk_format);
         mix(key.storage); mix(key.in_mip_tail); mix(key.srgb); mix(key.depth_compare);
-        mix(key.mip_levels);
+        mix(key.mip_levels); mix(key.renderer_source_format);
         return result;
     }
 };
@@ -1066,6 +1073,22 @@ struct CachedComputeImage {
     bool graphics_export_valid = false;
     prosper::gpu::GuestGpuWriteSnapshot compute_transfer_snapshot;
     bool compute_transfer_valid = false;
+    // The exact renderer publication this image holds the conversion of, for a renderer-owned
+    // sampled surface. Held as the `shared_ptr` rather than as a raw address ON PURPOSE, and the
+    // ownership is what makes pointer identity a sound content proof: `LiveTargetSnapshot::pixels`
+    // is a `shared_ptr<const std::vector<uint8_t>>`, so while this reference is alive the buffer
+    // cannot be freed (no address reuse, hence no ABA) and cannot be written (const). Pointer
+    // equality therefore implies byte equality without comparing 33 MB, which is the entire point:
+    // the alternative validations available here (the guest write journal and GuestWriteWatch)
+    // describe guest memory, and this surface has none -- prosper produced these bytes itself.
+    //
+    // COST, stated because it is not counted anywhere: holding this reference keeps one publication
+    // alive per cache entry, which the renderer would otherwise free -- so an entry costs roughly
+    // its image bytes AGAIN in host memory. That is bounded, because the number of entries is
+    // bounded by the existing image-cache budget (`persistent_compute_image_limit`), but the budget
+    // does not know about it: `image_cache_bytes` counts the Vulkan allocation only. Worth counting
+    // properly if this class ever grows past a handful of surfaces per title.
+    std::shared_ptr<const std::vector<uint8_t>> renderer_source;
     std::vector<uint8_t> source_snapshot;
     // Exact row-major bytes produced by the last storage dispatch. Full-overwrite post-processes
     // commonly reproduce the same large target on successive frames. Retaining the result lets a
@@ -1140,6 +1163,15 @@ VkDeviceSize compute_image_cache_minimum(const char* value, VkDeviceSize fallbac
     if (!end || *end) return fallback;
     if (kib > UINT64_MAX / 1024ull) return VkDeviceSize{UINT64_MAX};
     return static_cast<VkDeviceSize>(kib) * 1024ull;
+}
+
+// A/B seam and escape hatch for the renderer-owned sampled conversion cache (#3407). Off means
+// every dispatch reconverts, which is the pre-#3407 behaviour and the control arm every
+// measurement of this change is taken against.
+bool renderer_conversion_cache_enabled() {
+    static const bool enabled =
+        std::getenv("PROSPER_NO_RENDERER_CONVERSION_CACHE") == nullptr;
+    return enabled;
 }
 
 bool persistent_compute_image_enabled(VkDeviceSize bytes,
@@ -2365,6 +2397,67 @@ struct VulkanComputeContext {
         return true;
     }
 
+    // A renderer-owned sampled surface has no guest backing to validate against: prosper's own
+    // renderer produced these bytes, so neither the guest write journal nor a GuestWriteWatch says
+    // anything about them, and `guest_bytes` is 0. Its content proof is the identity of the
+    // published buffer instead -- see `CachedComputeImage::renderer_source` for why holding the
+    // `shared_ptr` is what makes that sound rather than merely convenient.
+    //
+    // Deliberately a separate entry point rather than a flag on `acquire_cached_image`: every
+    // validation branch in that function (submit journal, write watch, exact memcmp, snapshot
+    // retention) is about guest memory, and threading a fifth mode through them would make each
+    // one read as if it applied here. Nothing in this function consults guest state at all.
+    bool acquire_cached_renderer_sampled_image(
+            const ComputeImageCacheKey& key,
+            const std::shared_ptr<const std::vector<uint8_t>>& pixels,
+            VkImage& image, VkDeviceMemory& memory, bool& upload_skipped,
+            const void** cached_publication_out = nullptr,
+            bool* content_valid_out = nullptr) {
+        auto found = image_cache.find(key);
+        if (found == image_cache.end()) return false;
+        CachedComputeImage& cached = found->second;
+        cached.last_use = ++image_cache_clock;
+        ++cached.pins;
+        image = cached.image;
+        memory = cached.memory;
+        if (cached_publication_out) *cached_publication_out = cached.renderer_source.get();
+        if (content_valid_out) *content_valid_out = cached.content_valid;
+        upload_skipped = compute_renderer_conversion_cache_hit(
+            cached.content_valid, cached.renderer_source.get(), pixels.get());
+        if (!upload_skipped) {
+            // Adopt the new publication now so the entry names what the pending transfer will put
+            // in the image, and withhold authority until that transfer lands. A failed submit then
+            // leaves `content_valid` false and the next dispatch reconverts, rather than skipping
+            // against an image that never received these bytes.
+            remember_cached_renderer_source(key, pixels);
+            cached.content_valid = false;
+            cached.graphics_export_valid = false;
+            cached.compute_transfer_valid = false;
+        }
+        return true;
+    }
+
+    // Record the publication a freshly retained renderer-owned image was built from. Split from
+    // `retain_image` because that function's `source` parameter means guest bytes to snapshot, and
+    // there are none here. Deliberately does NOT touch `content_valid`: whether the image actually
+    // holds this publication yet is the caller's knowledge, not this function's, and the two call
+    // sites answer it differently.
+    void remember_cached_renderer_source(
+            const ComputeImageCacheKey& key,
+            const std::shared_ptr<const std::vector<uint8_t>>& pixels) {
+        auto found = image_cache.find(key);
+        if (found == image_cache.end()) return;
+        found->second.renderer_source = pixels;
+    }
+
+    // The transfer that filled this image completed, so the retained publication is now what the
+    // image actually holds. No guest snapshot is taken: there is no guest range to snapshot.
+    void validate_cached_renderer_image(const ComputeImageCacheKey& key) {
+        auto found = image_cache.find(key);
+        if (found == image_cache.end()) return;
+        found->second.content_valid = true;
+    }
+
     // DCC-compressed guest bytes cannot authorize an upload skip, but an exact unpinned cache entry
     // still owns a perfectly compatible Vulkan allocation. Lease that allocation before preparing
     // the mandatory seed so a changing producer does not destroy and recreate tens of MiB after
@@ -3359,6 +3452,10 @@ struct BoundImage {
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
     bool upload_skipped = false;         // write watch proved the cached source unchanged
+    // Renderer-owned sampled surfaces only (#3407): the exact `LiveTargetSnapshot::pixels`
+    // publication this binding's image was converted from. Non-null exactly when this binding
+    // participates in the renderer conversion cache.
+    std::shared_ptr<const std::vector<uint8_t>> renderer_cache_source;
     VkDeviceSize allocation_bytes = 0;
     VkDeviceSize staging_allocation_bytes = 0;
     // Exact bytes copied from the Vulkan image into staging. Native typed storage already has the
@@ -7682,6 +7779,77 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     transfer_borrow_result, transfer_gate_observation.first_match);
             }
 
+            // #3407: a renderer-owned SAMPLED surface reaches none of the caching above, because
+            // `compute_sampled_guest_prepare_required` excludes `renderer_owned` -- correctly, since
+            // that whole block resolves and validates GUEST bytes and this surface has none. The
+            // consequence was that prosper reconverted the identical 33 MB plane on every dispatch:
+            // measured on PPSA03831's intro, 441 conversions of one address against 148 distinct
+            // published buffers, i.e. two thirds of the work reproducing bytes it had already
+            // produced. Give the class the one identity it does have -- the published buffer.
+            //
+            // Restricted to the shape the conversion chain below actually handles as a single
+            // whole-surface unit. A mip chain or an array/volume target is excluded rather than
+            // reasoned about: the cost that motivated this is 2D 4K planes, and a wrong cache hit
+            // here would bind a stale image, which is silent visual corruption.
+            if (compute_renderer_conversion_cache_candidate({
+                    .renderer_owned = renderer_owned,
+                    .storage_image = bi.storage,
+                    .imported = bi.imported,
+                    .depth_bits_source = bi.depth_bits_source,
+                    .seed_skip = bi.seed_skip,
+                    .compute_transfer_seed_borrowed = bi.compute_transfer_seed_borrowed,
+                    .seeded_from_imported = bi.seed_from_imported != SIZE_MAX,
+                    .has_published_pixels = static_cast<bool>(live_target.pixels),
+                    .volume_or_array = dim_3d || dim_2d_array,
+                    .array_layers = bi.array_layers,
+                    .mip_levels = bi.mip_levels,
+                    .cache_enabled = renderer_conversion_cache_enabled(),
+                    .persistent_enabled = persistent_compute_image_enabled(
+                        sbytes, ComputeImageCacheClass::sampled),
+                })) {
+                bi.cache_key = ComputeImageCacheKey{
+                    .gpu_addr = r->gpu_addr,
+                    .resource_bytes = r->size,
+                    .width = r->width, .height = r->height, .depth = r->depth,
+                    .format = static_cast<uint32_t>(r->format),
+                    .components = sampled_components ? sampled_components : 1u,
+                    .img_dim = r->img_dim,
+                    .vk_format = static_cast<uint32_t>(image_format),
+                    .srgb = r->srgb,
+                    .depth_compare = r->depth_compare,
+                    .mip_levels = bi.mip_levels,
+                    // +1 so 0 stays reserved for "not a renderer publication", which is what keeps
+                    // this class from colliding with a guest-backed key on the same address.
+                    .renderer_source_format =
+                        static_cast<uint32_t>(live_target.format) + 1u,
+                };
+                bi.cache_candidate = true;
+                bi.renderer_cache_source = live_target.pixels;
+                const auto cache_lookup_start = ComputeClock::now();
+                const void* cached_publication = nullptr;
+                bool cached_content_valid = false;
+                bi.persistent = ctx.acquire_cached_renderer_sampled_image(
+                    bi.cache_key, bi.renderer_cache_source, bi.image, bi.memory,
+                    bi.upload_skipped, &cached_publication, &cached_content_valid);
+                if (bi.persistent && bi.upload_skipped)
+                    g_sampled_image_upload_skips.fetch_add(1, std::memory_order_relaxed);
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   renderer conversion cache binding=%u addr=0x%llx "
+                                 "extent=%ux%u src-format=%s persistent=%u upload-skipped=%u "
+                                 "cached-pub=%p now-pub=%p content-valid=%u\n",
+                                 bi.binding, (unsigned long long)r->gpu_addr,
+                                 r->width, r->height,
+                                 prosper::frontend::live_target_pixel_format_name(
+                                     live_target.format),
+                                 bi.persistent ? 1u : 0u, bi.upload_skipped ? 1u : 0u,
+                                 cached_publication,
+                                 static_cast<const void*>(bi.renderer_cache_source.get()),
+                                 cached_content_valid ? 1u : 0u);
+                cache_lookup_ms = std::chrono::duration<double, std::milli>(
+                    ComputeClock::now() - cache_lookup_start).count();
+            }
+
             // Allocate the host-visible staging buffer before conversion and write into its mapping
             // directly. The old path first built a heap upload and then memcpy'd the complete result
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
@@ -8075,7 +8243,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool f32 = sampled_f32;
                 const bool r11g11b10 = sampled_r11g11b10;
                 const bool unorm2_10_10_10 = sampled_unorm2_10_10_10;
-                if (renderer_owned) {
+                if (renderer_owned && bi.persistent && bi.upload_skipped) {
+                    // #3407 cache hit: this image already holds the conversion of exactly this
+                    // publication, proven by holding the `shared_ptr` rather than by comparing
+                    // 33 MB. Nothing to convert, and nothing to convert INTO -- the staging buffer
+                    // and its mapping were both skipped above, so `upload` is null here. This arm
+                    // exists so that fact is stated where a reader of the conversion chain sees it.
+                    bi.guest_bytes = 0;
+                } else if (renderer_owned) {
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
                     auto copy_snapshot_exact = [&]() {
                         if (pixels.size() != upload_size) return false;
@@ -9950,7 +10125,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (replaced_by_storage) continue;
             if (image.persistent) {
                 if (!image.upload_skipped) {
-                    if (image.compute_transfer_seed_borrowed)
+                    if (image.renderer_cache_source)
+                        // #3407: the transfer that filled this image from the retained publication
+                        // completed, so the entry may now authorize a skip. Deliberately NOT
+                        // `validate_cached_image_source`: that function rebuilds guest-memory
+                        // authority (write journal snapshot, watch, source snapshot) and this
+                        // surface has no guest range at all.
+                        ctx.validate_cached_renderer_image(image.cache_key);
+                    else if (image.compute_transfer_seed_borrowed)
                         ctx.validate_cached_image_source_from_compute_transfer(
                             image.cache_key);
                     else
@@ -9965,6 +10147,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                image.allocation_bytes,
                                                std::move(image.cache_source_snapshot)))) {
                 image.persistent = true;
+                if (image.renderer_cache_source) {
+                    // Name the publication this freshly retained image was converted from, and
+                    // authorize it: this loop runs after the fence, so the transfer that filled the
+                    // image has already completed. The next dispatch presenting the same buffer is
+                    // the one that gets to skip.
+                    ctx.remember_cached_renderer_source(image.cache_key,
+                                                        image.renderer_cache_source);
+                    ctx.validate_cached_renderer_image(image.cache_key);
+                }
                 if (trace)
                     std::fprintf(stderr,
                                  "[compute]   retained sampled image binding=%u addr=0x%llx "

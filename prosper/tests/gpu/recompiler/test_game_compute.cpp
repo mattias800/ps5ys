@@ -319,6 +319,83 @@ int main() {
           "imported-image recovery switch restores guest validation");
     CHECK(!prosper::frontend::compute_sampled_guest_prepare_required(true, false, false),
           "storage image retains its independent seed/writeback path");
+
+    // #3407: the renderer conversion cache. `compute_sampled_guest_prepare_required` above is why
+    // this exists -- it excludes renderer-owned surfaces from guest validation, correctly, and the
+    // consequence was that they had no cache identity at all and were reconverted every dispatch.
+    //
+    // Every arm below is a MUTATION of one admitting case, so each clause is shown to be
+    // load-bearing rather than merely present. Without that, a predicate that returned `true` for
+    // everything would pass an "it admits the good case" test.
+    {
+        using prosper::frontend::ComputeRendererConversionCacheInputs;
+        using prosper::frontend::compute_renderer_conversion_cache_candidate;
+        const ComputeRendererConversionCacheInputs admit{
+            .renderer_owned = true,
+            .has_published_pixels = true,
+            .cache_enabled = true,
+            .persistent_enabled = true,
+        };
+        CHECK(compute_renderer_conversion_cache_candidate(admit),
+              "a 2D renderer-owned sampled publication is a conversion-cache candidate");
+
+        const auto refuses = [&](auto mutate) {
+            ComputeRendererConversionCacheInputs in = admit;
+            mutate(in);
+            return !compute_renderer_conversion_cache_candidate(in);
+        };
+        CHECK(refuses([](auto& in) { in.renderer_owned = false; }),
+              "a guest-backed surface is not a conversion-cache candidate");
+        CHECK(refuses([](auto& in) { in.has_published_pixels = false; }),
+              "a renderer surface with no published buffer has no cache identity");
+        CHECK(refuses([](auto& in) { in.storage_image = true; }),
+              "a storage image keeps its own writeback-driven cache path");
+        CHECK(refuses([](auto& in) { in.imported = true; }),
+              "a directly imported image is the renderer's, not ours to cache");
+        CHECK(refuses([](auto& in) { in.depth_bits_source = true; }),
+              "a borrowed depth plane is not converted from a publication");
+        CHECK(refuses([](auto& in) { in.seed_skip = true; }),
+              "a write-only target is never seeded, so there is nothing to cache");
+        CHECK(refuses([](auto& in) { in.compute_transfer_seed_borrowed = true; }),
+              "a compute-transfer seed already supplies the image device-side");
+        CHECK(refuses([](auto& in) { in.seeded_from_imported = true; }),
+              "an image seeded by copy from the renderer needs no host conversion");
+        CHECK(refuses([](auto& in) { in.volume_or_array = true; }),
+              "volume and array shapes are excluded from the conversion cache");
+        CHECK(refuses([](auto& in) { in.array_layers = 2; }),
+              "a multi-layer publication is excluded from the conversion cache");
+        CHECK(refuses([](auto& in) { in.mip_levels = 2; }),
+              "a mip chain is excluded from the conversion cache");
+        CHECK(refuses([](auto& in) { in.cache_enabled = false; }),
+              "PROSPER_NO_RENDERER_CONVERSION_CACHE disables the cache");
+        CHECK(refuses([](auto& in) { in.persistent_enabled = false; }),
+              "a surface below the persistent-image threshold is not cached");
+    }
+
+    // The cache's entire correctness argument: a hit requires the SAME published buffer, and the
+    // entry must already hold a completed conversion of it. The identity is a pointer only because
+    // the cache holds the shared_ptr -- which is what makes the buffer neither freeable (no address
+    // reuse, no ABA) nor writable (const). A wrong `true` here binds a stale image, so each clause
+    // gets its own counter-arm.
+    {
+        using prosper::frontend::compute_renderer_conversion_cache_hit;
+        const std::vector<uint8_t> publication_a(4, 0u);
+        const std::vector<uint8_t> publication_b(4, 0u);
+        const void* const a = &publication_a;
+        const void* const b = &publication_b;
+        CHECK(compute_renderer_conversion_cache_hit(true, a, a),
+              "the same publication on a validated entry authorizes the upload skip");
+        CHECK(!compute_renderer_conversion_cache_hit(true, a, b),
+              "a different publication must reconvert, even at the same address and size");
+        CHECK(!compute_renderer_conversion_cache_hit(false, a, a),
+              "an entry whose transfer has not completed cannot authorize a skip");
+        CHECK(!compute_renderer_conversion_cache_hit(true, nullptr, a),
+              "an entry holding no publication cannot authorize a skip");
+        CHECK(!compute_renderer_conversion_cache_hit(true, a, nullptr),
+              "a binding with no publication cannot take a skip");
+        CHECK(!compute_renderer_conversion_cache_hit(true, nullptr, nullptr),
+              "two absent publications are not a match");
+    }
     CHECK(prosper::frontend::storage_writeback_can_tile_mapped_bytes(
               true, 27, false, false),
           "exact-width tiled storage can feed mapped bytes directly to the tiler");

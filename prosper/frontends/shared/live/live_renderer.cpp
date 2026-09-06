@@ -278,6 +278,21 @@ const char* rtt_guest_write_effect_name(prosper::frontend::LiveRttGuestWriteEffe
     }
 }
 
+// #3407 reset-site census: which code path nulls a renderer surface's CPU publication. Shares
+// PROSPER_RTT_REMAT_LOG with the read-side census so one run answers both halves -- "is the readback
+// repeated" and "what invalidates it".
+inline void rtt_remat_note_reset(const char* site, uint64_t addr) {
+    static const bool on = std::getenv("PROSPER_RTT_REMAT_LOG") != nullptr;
+    if (!on) return;
+    static std::mutex m;
+    static std::map<std::pair<std::string, uint64_t>, uint64_t> rows;
+    std::lock_guard<std::mutex> lk(m);
+    uint64_t& n = rows[{std::string(site), addr}];
+    if (++n % 32 == 0)
+        std::fprintf(stderr, "[rtt-reset] site=%s addr=0x%llx count=%llu\n",
+                     site, (unsigned long long)addr, (unsigned long long)n);
+}
+
 void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
     auto& watch = rtt_invalidate_watch();
@@ -339,11 +354,13 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
         const auto effect = prosper::frontend::live_rtt_guest_write_effect(
             it->first, bytes, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, addr, size);
         if (effect == prosper::frontend::LiveRttGuestWriteEffect::color_plane) {
+            rtt_remat_note_reset("guest-color-plane-erase", it->first);
             it = cache.erase(it);
         } else if (effect == prosper::frontend::LiveRttGuestWriteEffect::dcc_metadata) {
             // Keep the surface identity/extent long enough to materialize a uniform DCC clear from
             // the descriptor in the following graphics span, but never LOAD or sample stale pixels.
             prosper::test::invalidate_persistent_color_target(it->first);
+            rtt_remat_note_reset("dcc-metadata-write", it->first);
             it->second.rgba.reset();
             it->second.has_uniform_color = false;
             it->second.gpu_valid = false;
@@ -1399,6 +1416,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if ((!surface.rgba || surface.rgba->size() != expected) &&
                 surface.has_uniform_color)
                 materialize_uniform_rtt(surface);
+            // PROSPER_RTT_REMAT_LOG=1 -- diagnostic only (#3407). A renderer-owned surface that
+            // re-materializes on EVERY compute read is doing a full GPU->CPU readback per read, and
+            // it also hands the consumer a fresh buffer each time, which is why a pointer-identity
+            // conversion cache measured a structural 0% hit rate. This reports the split so the
+            // question "is the readback repeated, and why" is answered by counting rather than by
+            // inferring it from consumer-side pointers.
+            {
+                static const bool remat_log = std::getenv("PROSPER_RTT_REMAT_LOG") != nullptr;
+                if (remat_log) {
+                    static std::mutex m;
+                    struct Counts { uint64_t reads, reuse, null_remat, size_remat, no_gpu; };
+                    static std::map<uint64_t, Counts> rows;
+                    std::lock_guard<std::mutex> lk(m);
+                    Counts& c = rows[addr];
+                    ++c.reads;
+                    const bool bad = !surface.rgba || surface.rgba->size() != expected;
+                    if (!bad) ++c.reuse;
+                    else if (!surface.gpu_valid) ++c.no_gpu;
+                    else if (!surface.rgba) ++c.null_remat;
+                    else ++c.size_remat;
+                    if (c.reads % 64 == 0)
+                        std::fprintf(stderr,
+                                     "[rtt-remat] addr=0x%llx reads=%llu reuse=%llu "
+                                     "remat-null=%llu remat-size=%llu no-gpu=%llu bytes=%llu\n",
+                                     (unsigned long long)addr,
+                                     (unsigned long long)c.reads, (unsigned long long)c.reuse,
+                                     (unsigned long long)c.null_remat,
+                                     (unsigned long long)c.size_remat,
+                                     (unsigned long long)c.no_gpu,
+                                     (unsigned long long)expected);
+                }
+            }
             // Graphics-to-graphics intermediates normally stay in the persistent Vulkan target.
             // Compute cannot import that color attachment directly, so materialize its current
             // pixels only when an ordered compute dispatch actually consumes the surface.
@@ -1555,6 +1604,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     write.gpu_addr, write.width, write.height, format))
                 return;
             RttSurf& published = g_rtt[write.gpu_addr];
+            rtt_remat_note_reset("mirrored-write", write.gpu_addr);
             published.rgba.reset();
             published.has_uniform_color = false;
             published.w = write.width;
@@ -2389,6 +2439,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
                             continue;
                         }
+                        rtt_remat_note_reset("dcc-fast-clear", found->first);
                         found->second.rgba.reset();
                         found->second.has_uniform_color = true;
                         for (uint32_t channel = 0; channel < 4; ++channel)

@@ -79,6 +79,59 @@ constexpr bool compute_sampled_guest_prepare_required(bool storage_image,
            (!imported_image || imported_bypass_disabled);
 }
 
+// #3407. `compute_sampled_guest_prepare_required` above excludes renderer-owned surfaces, and
+// rightly so: that path resolves and validates GUEST bytes, and a surface prosper's own renderer
+// produced has none. The consequence was that such a surface had no cache identity at all, so every
+// dispatch reconverted it -- measured on Sonic Frontiers' intro at 441 conversions of a single
+// 33 MB plane against 148 distinct published buffers.
+//
+// The identity it does have is the publication: `LiveTargetSnapshot::pixels` is a
+// `shared_ptr<const std::vector<uint8_t>>`. A cache entry that HOLDS that shared_ptr keeps the
+// buffer alive (so its address cannot be reused) and the buffer is const (so its bytes cannot
+// change), which is what makes pointer equality a sound proof of byte equality. Both halves are
+// load-bearing: holding a raw address instead would admit an ABA match after the renderer frees and
+// reallocates, and that would bind a stale image -- silent visual corruption, the failure this
+// project least wants.
+struct ComputeRendererConversionCacheInputs {
+    bool renderer_owned = false;
+    bool storage_image = false;
+    bool imported = false;
+    bool depth_bits_source = false;
+    bool seed_skip = false;
+    bool compute_transfer_seed_borrowed = false;
+    bool seeded_from_imported = false;
+    bool has_published_pixels = false;
+    // The conversion chain treats a renderer publication as one whole 2D surface. Volume, array and
+    // mip-chain shapes are excluded rather than reasoned about; the cost this exists for is 2D 4K
+    // planes, and a wrong hit here is silent visual corruption rather than a slow frame.
+    bool volume_or_array = false;
+    uint32_t array_layers = 1;
+    uint32_t mip_levels = 1;
+    bool cache_enabled = true;
+    bool persistent_enabled = false;
+};
+
+constexpr bool compute_renderer_conversion_cache_candidate(
+        const ComputeRendererConversionCacheInputs& in) {
+    return in.cache_enabled && in.persistent_enabled &&
+           in.renderer_owned && in.has_published_pixels &&
+           !in.storage_image && !in.imported && !in.depth_bits_source &&
+           !in.seed_skip && !in.compute_transfer_seed_borrowed && !in.seeded_from_imported &&
+           !in.volume_or_array && in.array_layers == 1u && in.mip_levels == 1u;
+}
+
+// The whole correctness argument for the cache, in one predicate so it can be tested with a
+// mutation arm per clause rather than inferred from the call site. `content_valid` is false while a
+// transfer is outstanding or after a failed submit, so a hit can never be authorized against an
+// image that did not receive these bytes.
+constexpr bool compute_renderer_conversion_cache_hit(bool content_valid,
+                                                      const void* cached_publication,
+                                                      const void* current_publication) {
+    return content_valid && cached_publication != nullptr &&
+           current_publication != nullptr &&
+           cached_publication == current_publication;
+}
+
 // Materialize a proven uniform DCC fast clear for the narrow sampled representation used by an
 // ordinary guest-backed 2D RGBA16F compute input. The complete metadata plane, guest shape,
 // reflected non-arrayed view, and rollback state are part of the proof; any unsupported state
