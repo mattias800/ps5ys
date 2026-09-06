@@ -626,13 +626,18 @@ uint32_t   g_a2_users = 0;
 // each tick the guest calls PortSetAttributes(port, attrs, count) where an attribute triple
 // {u32 id=0, u32 reserved, value_ptr, value_size=8} carries a guest pointer to the port's current grain of
 // interleaved PCM (grain frames from the context param, 256 live). ContextAdvance
-// advances engine state and ContextPush submits the grain to the device. We store each port's PCM
-// pointer here and mix + forward all ports' grains to the host AudioSink at Push.
+// advances engine state and ContextPush submits the grain to the device. SetAttributes must copy
+// each grain: guests reuse one scratch buffer for multiple ports before Advance/Push (#3411).
 struct A2PortState {
     bool     used = false;
     uint32_t generation = 0;
     uint64_t context = 0;      // owning context; Push must not submit another context's ports
-    uint64_t pcm_ptr = 0;      // guest address of this port's current PCM grain (attr id 0)
+    uint64_t pcm_ptr = 0;      // source address, retained for diagnostics (attr id 0)
+    // Normalize the guest's interleaved grain into independently owned channel buffers. Neither
+    // another output's scratch reuse nor the final stereo mix can change these source channels.
+    std::array<std::vector<float>, kAudioMaxBedChannels> pcm_channels;
+    uint32_t pcm_frames = 0;
+    bool pcm_pending = false; // a submission is consumed once, never looped to fill a late grain
     uint16_t type = 0;         // portParam +0x00: 0 = MAIN (speaker output); others aux (personal/...)
     uint32_t data_format = 0;  // portParam +0x04: bits 8..15=channels, bits 0..6=0 F32 / 1 S16,
                                // bit 7 selects the standard 8-channel order
@@ -679,7 +684,7 @@ using FlowSignal = AudioSignalStats;
 
 struct FlowPort {
     uint64_t reads = 0, mixed = 0, frames = 0, bytes = 0;
-    uint64_t no_pcm = 0, skip_fmt = 0, skip_not_main = 0, short_read = 0;
+    uint64_t no_pcm = 0, no_grain = 0, skip_fmt = 0, skip_not_main = 0, short_read = 0;
     uint16_t type = 0;
     uint32_t data_format = 0;
     FlowSignal sig;
@@ -795,7 +800,7 @@ void audio_flow_report(uint32_t slot) {
         fprintf(stderr,
                 "[audio-flow]   port%u type=0x%x fmt=0x%x reads=%llu mixed=%llu frames=%llu bytes=%llu"
                 " peak=%.5f rms=%.5f nonzero=%llu/%llu nan=%llu no-pcm=%llu skip-fmt=%llu"
-                " skip-not-main=%llu short=%llu"
+                " skip-not-main=%llu short=%llu no-grain=%llu"
                 " | LIFE: nonzero=%llu/%llu peak=%.5f rms=%.5f nan=%llu\n",
                 i + 1, p.type, p.data_format, (unsigned long long)p.reads,
                 (unsigned long long)p.mixed, (unsigned long long)p.frames,
@@ -804,12 +809,13 @@ void audio_flow_report(uint32_t slot) {
                 (unsigned long long)p.nan_samples,
                 (unsigned long long)p.no_pcm, (unsigned long long)p.skip_fmt,
                 (unsigned long long)p.skip_not_main, (unsigned long long)p.short_read,
+                (unsigned long long)p.no_grain,
                 (unsigned long long)p.life.nonzero, (unsigned long long)p.life.samples,
                 p.life.peak, p.life.rms(), (unsigned long long)p.life_nan);
         // Per-interval counters: reset so each line describes the LAST second, not the whole run.
         // The `life:` totals above are deliberately NOT reset.
         p.reads = p.mixed = p.frames = p.bytes = 0;
-        p.no_pcm = p.skip_fmt = p.skip_not_main = p.short_read = p.nan_samples = 0;
+        p.no_pcm = p.no_grain = p.skip_fmt = p.skip_not_main = p.short_read = p.nan_samples = 0;
         p.seen = false;
         p.sig.reset();
     }
@@ -1864,7 +1870,7 @@ HLE(audio2_port_get_state) {
 // Attribute = {u32 id, u32 reserved, const void* value, size_t valueSize} (0x18 stride).
 // `reserved` is ABI padding and may be indeterminate (GTA V leaves stack-address bits there), so
 // it must never be folded into the id. Live-decoded ids:
-//   0 = per-grain PCM data pointer (value: a guest pointer qword to interleaved stereo f32 samples).
+//   0 = per-grain PCM data pointer (value: a guest pointer qword; port format sizes the samples).
 // Unknown ids are skipped fail-visibly under PROSPER_AUDIO2LOG. CONFIDENCE: HIGH (Evergate + GTA V).
 HLE(audio2_port_set_attr) {
     A2LOG("sceAudioOut2PortSetAttributes");
@@ -1884,6 +1890,36 @@ HLE(audio2_port_set_attr) {
             uint64_t pcm = 0;
             if (audio_read_bytes(at.vptr, &pcm, 8)) {
                 port->pcm_ptr = pcm;
+                port->pcm_frames = 0;
+                port->pcm_pending = pcm != 0;
+                const auto* context = audio2_context_locked(port->context);
+                const uint32_t frames = context && context->grain >= 64 && context->grain <= 4096
+                    ? context->grain : 256;
+                const uint32_t channels = audio2_format_channels(port->data_format);
+                const uint32_t type = port->data_format & 0x7fu;
+                if (pcm && channels >= 1 && channels <= kAudioMaxBedChannels &&
+                    (type == 0 || type == 1)) {
+                    const size_t sample_bytes = type == 0 ? sizeof(float) : sizeof(int16_t);
+                    static thread_local std::vector<uint8_t> source;
+                    source.resize(static_cast<size_t>(frames) * channels * sample_bytes);
+                    const size_t got = audio_read_bytes_partial(pcm, source.data(), source.size());
+                    port->pcm_frames = static_cast<uint32_t>(got / (channels * sample_bytes));
+                    for (uint32_t channel = 0; channel < channels; ++channel) {
+                        auto& output = port->pcm_channels[channel];
+                        output.resize(port->pcm_frames);
+                        for (uint32_t frame = 0; frame < port->pcm_frames; ++frame) {
+                            const auto* sample = source.data() +
+                                (static_cast<size_t>(frame) * channels + channel) * sample_bytes;
+                            if (type == 0) {
+                                std::memcpy(&output[frame], sample, sizeof(float));
+                            } else {
+                                int16_t value;
+                                std::memcpy(&value, sample, sizeof(value));
+                                output[frame] = value * (1.0f / 32768.0f);
+                            }
+                        }
+                    }
+                }
                 // Reached-ness: the guest handing us a PCM buffer address is the last step before
                 // submission, so this separates "never wired up audio" from "wired up, never pushed".
                 if (pcm && audio_flow()) ++g_flow_pcm_published;
@@ -1950,7 +1986,7 @@ HLE(audio2_ctx_push) {
     A2LOG("sceAudioOut2ContextPush");
     uint32_t grain = 256;
     uint32_t context_slot = 0;
-    // Reserve one hardware queue slot before reading the guest grain. A nonblocking push on a full
+    // Reserve one hardware queue slot before mixing the submitted grains. A nonblocking push on a full
     // queue returns NOT_READY; a blocking push waits until the 48 kHz device clock drains a slot.
     for (;;) {
         std::chrono::nanoseconds wait_duration{};
@@ -1987,6 +2023,7 @@ HLE(audio2_ctx_push) {
     static thread_local std::vector<float> tmp;
     static thread_local std::vector<int16_t> tmp_s16;
     bool have_pcm = false;
+    bool have_main_stream = false;
     {
         std::lock_guard<std::mutex> lk(g_a2_mx);
         A2Context* c = audio2_context_locked(a0);
@@ -2000,7 +2037,7 @@ HLE(audio2_ctx_push) {
         float object_peak = 0.0f;
         int object_peak_port = 0;
         int pidx_probe = 0;
-        for (const auto& ps : g_a2_port_state) {
+        for (auto& ps : g_a2_port_state) {
             const int this_pidx = pidx_probe++;
             if (!ps.used || ps.context != a0) continue;
             // A port belonging to this context but carrying no published PCM pointer is a distinct
@@ -2099,23 +2136,23 @@ HLE(audio2_ctx_push) {
                 }
                 continue;
             }
-            const uint32_t read_samples = channels * grain;
-            size_t frames_got = 0;
-            if (data_type == 0) {
-                if (tmp.size() < read_samples) tmp.resize(read_samples);
-                const size_t got = audio_read_bytes_partial(
-                    ps.pcm_ptr, tmp.data(), sizeof(float) * read_samples);
-                frames_got = got / (sizeof(float) * channels);
-            } else {
-                if (tmp_s16.size() < read_samples) tmp_s16.resize(read_samples);
-                const size_t got = audio_read_bytes_partial(
-                    ps.pcm_ptr, tmp_s16.data(), sizeof(int16_t) * read_samples);
-                frames_got = got / (sizeof(int16_t) * channels);
+            have_main_stream |= ps.type == 0;
+            // The stamp probes writes to the guest source, independently of the owned submission
+            // used by this mix. Opt-in, one port, bounded. See PROSPER_AUDIO_STAMP above.
+            audio_stamp_step((uint32_t)this_pidx, ps.pcm_ptr, channels, data_type, grain);
+            if (!ps.pcm_pending) {
+                if (flow) {
+                    std::lock_guard<std::mutex> flk(g_flow_mx);
+                    FlowPort& fp = g_flow_port[this_pidx];
+                    flow_tag_port(fp, context_slot, ps.type, ps.data_format);
+                    ++fp.no_grain;
+                }
+                continue;
             }
+            ps.pcm_pending = false;
+            const size_t frames_got = std::min(ps.pcm_frames, grain);
             auto sample_at = [&](size_t frame, uint32_t channel) {
-                const size_t sample = frame * channels + channel;
-                return data_type == 0 ? tmp[sample]
-                                      : (float)tmp_s16[sample] * (1.0f / 32768.0f);
+                return ps.pcm_channels[channel][frame];
             };
             // Per-channel layout measurement, before any routing decision, so the fold-down for a
             // wide bed rests on the guest's measured content rather than on an assumed enumeration.
@@ -2134,21 +2171,17 @@ HLE(audio2_ctx_push) {
                             (data_type == 0 ? sizeof(float) : sizeof(int16_t));
                 if (frames_got < grain) ++fp.short_read;
                 for (size_t k = 0, nf = frames_got * channels; k < nf; ++k) {
-                    const float v = data_type == 0 ? tmp[k] : (float)tmp_s16[k] * (1.0f / 32768.0f);
+                    const float v = sample_at(k / channels, k % channels);
                     flow_add_sample(fp, v);   // NaN counted, then treated as the silence it becomes
                 }
                 if (ps.type != 0) ++fp.skip_not_main; else ++fp.mixed;
             }
-            // AFTER this push's grain has been read and measured, and before the mix (which works
-            // from the host-side copy in `tmp`, so it is unaffected): ask whether the guest writes
-            // the buffer we just read. Opt-in, one port, bounded. See PROSPER_AUDIO_STAMP above.
-            audio_stamp_step((uint32_t)this_pidx, ps.pcm_ptr, channels, data_type, grain);
             if (probe) {
                 static uint64_t call_ct[kA2MaxPorts] = {0};
                 const size_t nf = frames_got * channels;
                 size_t nan_ct = 0; float amax = 0.0f;
                 for (size_t k = 0; k < nf; k++) {
-                    float v = data_type == 0 ? tmp[k] : (float)tmp_s16[k] * (1.0f / 32768.0f);
+                    float v = sample_at(k / channels, k % channels);
                     if (v != v) nan_ct++; else { float a = v < 0 ? -v : v; if (a > amax) amax = a; } }
                 // Object-heavy engines keep hundreds of valid but silent ports. Reporting every
                 // silent buffer once per 64 grains both hides the active route and perturbs its
@@ -2255,7 +2288,10 @@ HLE(audio2_ctx_push) {
     };
 
     AudioSink* sink = audio_sink();
-    if (sink && have_pcm) {
+    if (sink && have_main_stream) {
+        // Keep an established stream continuous when a port misses a submission. The cleared bed
+        // supplies silence for that interval; replaying its last grain produces a 187.5 Hz buzz at
+        // the common 256-frame grain, while skipping output starves the host device queue.
         // Forward the mixed grain to the host device; the sink paces one grain per call in real
         // time (same contract as the v1 sceAudioOutOutput path), so no extra sleep on this path.
         // A FAILED device open must fall through to the silent wall-clock pacing below instead:

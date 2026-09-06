@@ -48,6 +48,28 @@ cmake -S prosper -B build -DPROSPER_AUDIO_SDL3=ON   # uses system SDL3 if presen
   (matching hardware pacing). Per-channel volumes are mapped to the stream gain.
 - When enabled, `boot_trace` calls `install_sdl3_audio_sink()` at startup automatically.
 
+## AudioOut2 submission ownership (#3411)
+
+`PortSetAttributes` copies each PCM grain while the caller's buffer is valid and separates its
+interleaved samples into independently owned float buffers for every port/channel. MAIN channels
+are folded into the context's stereo bed only at `ContextPush`; auxiliary outputs keep their own
+source buffers and are not mixed into the speakers. A push consumes a submission once. A missing
+submission contributes silence while the host stream keeps its normal cadence.
+
+Sonic Frontiers reuses one scratch address for its eight-channel MAIN output and stereo auxiliary
+output. Reading that address at Push lost the MAIN samples when the auxiliary submission cleared
+it. Retaining the last copied grain indefinitely also failed: a 105-second capture contained
+7,824 repeated audible grains out of 9,489, producing severe buzzing. With one-time consumption,
+another 105-second capture contained 1,665 audible grains and **zero adjacent repeats**. This fixes
+ownership and replay, not the producer's low delivery rate: the windowed run delivered only about
+33–40 fresh grains per second against 188 output intervals. The listener confirmed recognizable
+Sonic ring audio, with severe interruptions. A renderer-disabled control raised fresh submissions
+to about 106 per second, still below 188; continuous playback remains unresolved (#3411).
+
+`audio_hle` exercises shared scratch reuse by two MAIN outputs and an auxiliary output, distinct
+left/right contributions, F32 and S16 conversion, replacement with silence, and a missing next
+submission. Existing channel-routing and context-lifetime checks remain in the same suite.
+
 ## Diagnosing a silent title — `PROSPER_AUDIO_FLOW=1`
 
 "No audio" has three mutually exclusive causes that are **indistinguishable from outside** and need
@@ -91,8 +113,9 @@ verdict is in `LIFE:`.
 | no `[audio-flow]` lines at all | the guest never created an AudioOut2 context |
 | `ctx…created` but no interval lines | a context exists, but the pump loop never runs |
 | `advance=N push=0` | the pump runs but never submits — **case 1** |
-| `push=N`, **`BED LIFE: nonzero=0/M`** | real submissions carrying exact silence — **case 2** |
-| `push=N`, **`BED LIFE: nonzero>0`** | signal reaches the host sink — **case 3**, look at the sink/volume |
+| `push=N`, **`BED LIFE: nonzero=0/M`** | the mixed bed is silent; inspect port submission and routing counters to distinguish missing data, silent data, and discarded data |
+| `push=N`, **`BED LIFE: nonzero>0`** | signal reaches the bed; confirm sink-open status and delivery before attributing any remaining fault to volume |
+| `no-grain=N` | this port supplied no fresh grain for N push intervals; silence filled those intervals instead of replaying old audio |
 | any port with `LIFE: nonzero>0` but `mixed=0` | **prosper is discarding real audio** — read `skip-fmt` / `skip-not-main` to see why |
 
 The last row is the one that matters most and is invisible in the bed alone: a port can carry the
@@ -306,7 +329,7 @@ a reported gap.
 
 ## Is the grain prosper READS the grain the guest WRITES? — `PROSPER_AUDIO_STAMP`
 
-Everything above is computed from one read of the guest's buffer, so none of it can separate the
+Signal measurements use the owned submission copied at SetAttributes. They cannot separate the
 two causes of a port that measures exactly zero:
 
 - **(a)** the guest holds the bus open and mixes silence into it — a non-defect, and
@@ -318,7 +341,7 @@ two causes of a port that measures exactly zero:
 instrument until something outside that instrument says otherwise, and no additional statistic
 derived from the same read can be that something — it would inherit the assumption under test.
 
-`PROSPER_AUDIO_STAMP` settles it by **writing**. After the mix has consumed a grain it stamps the
+`PROSPER_AUDIO_STAMP` probes this by **writing**. Independently of the owned mix buffers, it stamps the
 guest's own grain buffer with a per-channel-distinct pattern, and on the next push classifies what
 comes back:
 

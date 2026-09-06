@@ -811,6 +811,62 @@ int main() {
     }
     CHECK(call("sceAudioOut2PortDestroy", a2_port) == 0);
 
+    // #3411: MAIN and auxiliary ports can submit from the same scratch buffer. The guest
+    // overwrites it between SetAttributes calls, and again before Advance/Push. Each port must
+    // keep its own submission, including on the S16 path; delaying the copy until Push loses it.
+    for (uint32_t format : {0x200u, 0x201u}) {
+        auto main_param = a2_port_param;
+        main_param.data_format = format;
+        auto aux_param = main_param;
+        aux_param.type = 6;
+        uint64_t main_port = 0, aux_port = 0, second_main = 0;
+        CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&main_param), PTR(&main_port)) == 0);
+        CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&aux_param), PTR(&aux_port)) == 0);
+        CHECK(call("sceAudioOut2PortCreate", a2_context, PTR(&main_param), PTR(&second_main)) == 0);
+        std::vector<float> scratch_f32(64 * 2, 0.25f);
+        std::vector<int16_t> scratch_s16(64 * 2, 8192);
+        uint64_t scratch = format == 0x200 ? PTR(scratch_f32.data()) : PTR(scratch_s16.data());
+        A2Attribute scratch_attr{0, 0, PTR(&scratch), sizeof(scratch)};
+        CHECK(call("sceAudioOut2PortSetAttributes", main_port, PTR(&scratch_attr), 1) == 0);
+        for (size_t i = 0; i < scratch_f32.size(); ++i) {
+            scratch_f32[i] = i % 2 ? -0.125f : 0.125f;
+            scratch_s16[i] = i % 2 ? -4096 : 4096;
+        }
+        CHECK(call("sceAudioOut2PortSetAttributes", second_main, PTR(&scratch_attr), 1) == 0);
+        std::fill(scratch_f32.begin(), scratch_f32.end(), -0.5f);
+        std::fill(scratch_s16.begin(), scratch_s16.end(), -16384);
+        CHECK(call("sceAudioOut2PortSetAttributes", aux_port, PTR(&scratch_attr), 1) == 0);
+        std::fill(scratch_f32.begin(), scratch_f32.end(), 0.0f);
+        std::fill(scratch_s16.begin(), scratch_s16.end(), 0);
+        CHECK(call("sceAudioOut2ContextAdvance", a2_context) == 0);
+        sink.outs.clear();
+        CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+        CHECK(sink.outs.size() == 1);
+        if (!sink.outs.empty()) {
+            const float* stereo = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+            for (size_t i = 0; i < 64 * 2; ++i) CHECK(stereo[i] == (i % 2 ? 0.125f : 0.375f));
+        }
+        // A late producer must not loop either port's old grain or starve the host stream.
+        sink.outs.clear();
+        CHECK(call("sceAudioOut2ContextAdvance", a2_context) == 0);
+        CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+        CHECK(sink.outs.size() == 1);
+        if (!sink.outs.empty())
+            CHECK(audio_count_nonzero_samples(sink.outs[0].pcm.data(),
+                                              sink.outs[0].pcm.size(), false) == 0);
+        // Republishing that same address replaces the saved grain, including explicit silence.
+        CHECK(call("sceAudioOut2PortSetAttributes", main_port, PTR(&scratch_attr), 1) == 0);
+        sink.outs.clear();
+        CHECK(call("sceAudioOut2ContextPush", a2_context, 1) == 0);
+        CHECK(sink.outs.size() == 1);
+        if (!sink.outs.empty())
+            CHECK(audio_count_nonzero_samples(sink.outs[0].pcm.data(),
+                                              sink.outs[0].pcm.size(), false) == 0);
+        CHECK(call("sceAudioOut2PortDestroy", main_port) == 0);
+        CHECK(call("sceAudioOut2PortDestroy", aux_port) == 0);
+        CHECK(call("sceAudioOut2PortDestroy", second_main) == 0);
+    }
+
     // AudioOut2 main-bed flag bit 1 reserves 20 dB of digital headroom for platform mastering.
     // Restore that reference level only for marked ports, then saturate at the host PCM boundary;
     // the flag-zero byte-for-byte assertion above is the control that ordinary/video ports keep
