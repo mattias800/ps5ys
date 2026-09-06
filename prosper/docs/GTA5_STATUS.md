@@ -52,6 +52,27 @@ that `make_shader_compile_key` computed a provisional hash which all three calle
 overwrote after attaching diagnostic settings. Removing that first calculation preserves the final key,
 equality checks and shader output. End-to-end performance improvement is not yet established.
 
+### Duplicate storage-image preparation (#3065)
+
+On merged `805b49d53`, a later native Performance Story F8 isolated **3.512 ms** in the first
+duplicate storage binding's pre-alias-processing interval, against **3.836 ms** total setup for
+program hash `1d3f91e7f9a30140` (28 fully warm dispatches). Its 3840×2160 RGBA8 output binds one
+canonical storage image and three exact aliases. The interval is not the cost of copying alias
+fields: the backend requests an RTT snapshot before discovering the alias, while only the owner
+publishes a binding-specific coverage proof. The renderer can materialize a full target on that read.
+
+Exact write-only storage aliases now fold before this redundant snapshot/coverage preparation,
+after descriptor, device, shape and DCC validation and the ownership query's pending-write drain.
+Reflected storage representation and complete resource-view identity must match. Canonical seeding,
+partial-write preservation and one writeback remain; sampled and mixed-access bindings retain the
+late path. Synthetic execution checks both aliases' distinct pixels, necessary partial seeds and
+missing-seed rejection; disabling only the early fold fails seven assertions. This establishes the
+mechanism, not an end-to-end speedup. Native comparison evidence remains in #3065.
+
+The phase-report tool's alias records are **not zero work**: this capture has 101.930 ms in aliases
+versus 26.963 ms in real-image records. The report's misleading alias-only wording is tracked in
+#3388. Do not treat its real-image-only decomposition as all image setup.
+
 ## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.

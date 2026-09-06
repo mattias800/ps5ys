@@ -6334,6 +6334,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             image_timing_requested && timing_item_selected &&
             (!timing_capture_only || perf_capture_timing) &&
             (!timing_trace_only || trace);
+        const auto bind_image_alias = [&](size_t i, size_t j, ComputeClock::time_point start) {
+            BoundImage& bi = images[i];
+            bi.alias_of = images[j].alias_of == SIZE_MAX ? j : images[j].alias_of;
+            const BoundImage& owner = images[bi.alias_of];
+            bi.image = owner.image; bi.memory = owner.memory; bi.view = owner.view;
+            bi.sampler = owner.sampler; bi.guest_bytes = owner.guest_bytes;
+            bi.texel_depth = owner.texel_depth;
+            bi.array_layers = owner.array_layers;
+            bi.mip_levels = owner.mip_levels;
+            bi.mip_staging_offsets = owner.mip_staging_offsets;
+            bi.dcc_metadata = owner.dcc_metadata;
+            bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
+            staging_bytes[i] = staging_bytes[bi.alias_of];
+            const ShaderResource& r = *bi.resource;
+            if (trace)
+                std::fprintf(stderr, "[compute]   image-alias binding=%u -> binding=%u addr=0x%llx\n",
+                             bi.binding, owner.binding, (unsigned long long)r.gpu_addr);
+            if (image_timing)
+                std::fprintf(stderr,
+                             "[compute-image] code=0x%llx hash=0x%016llx "
+                             "binding=%u class=%s alias=1 addr=0x%llx alias_of=%u "
+                             "persistent=%u upload-skipped=%u "
+                             "extent=%ux%ux%u ms=%.3f\n",
+                             (unsigned long long)item.code_addr,
+                             (unsigned long long)timing_program_hash, bi.binding,
+                             bi.storage ? "storage" : "sampled",
+                             (unsigned long long)r.gpu_addr, owner.binding,
+                             owner.persistent ? 1u : 0u,
+                             owner.upload_skipped ? 1u : 0u,
+                             r.width, r.height, r.depth,
+                             std::chrono::duration<double, std::milli>(
+                                 ComputeClock::now() - start).count());
+        };
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
             // Every skip_image call below is inside this loop, so the cursor is always the binding
             // being decided.
@@ -6541,6 +6574,45 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
             query_ms = std::chrono::duration<double, std::milli>(
                 ComputeClock::now() - query_start).count();
+            // Exact write-only storage aliases already have a fully prepared canonical image.
+            // Fold before requesting an RTT snapshot or consulting this binding's coverage proof:
+            // only the owner writes back and publishes a proof, so the duplicate would otherwise
+            // keep requesting a snapshot even after the owner has proved a full overwrite.
+            // Keep the ownership query above: the live renderer also drains pending guest writes.
+            // Sampled/imported representations and mixed-access bindings retain the late path.
+            const auto& decl = image_descriptors[i];
+            if (bi.storage && decl.writable && !decl.readable && !decl.atomic_access) {
+                for (size_t j = 0; j < i; ++j) {
+                    const BoundImage& owner = images[j];
+                    const auto& owner_decl = image_descriptors[j];
+                    if (!owner.storage || owner.alias_of != SIZE_MAX || !owner.resource ||
+                        !owner_decl.writable || owner_decl.readable || owner_decl.atomic_access)
+                        continue;
+                    const bool same_representation =
+                        decl.image_numeric_class == owner_decl.image_numeric_class &&
+                        decl.storage_image_format == owner_decl.storage_image_format &&
+                        decl.image_dim == owner_decl.image_dim &&
+                        decl.image_arrayed == owner_decl.image_arrayed &&
+                        decl.image_multisampled == owner_decl.image_multisampled &&
+                        decl.image_depth == owner_decl.image_depth &&
+                        bi.native_float_storage == owner.native_float_storage &&
+                        bi.native_uint_storage == owner.native_uint_storage &&
+                        bi.packed_r11_storage == owner.packed_r11_storage &&
+                        bi.graphics_sampled_usage == owner.graphics_sampled_usage &&
+                        !owner.imported && !owner.depth_bits_source &&
+                        !owner.unorm_rtt_value_reuse;
+                    const prosper::gpu::ComputeImageViewShape owner_shape{
+                        owner.storage, owner.texel_depth, owner.array_layers};
+                    const prosper::gpu::ComputeImageViewShape this_shape{
+                        bi.storage, bi.texel_depth, bi.array_layers};
+                    if (!prosper::gpu::shader_resource_same_view(
+                            *owner.resource, *r, owner_shape, this_shape, same_representation))
+                        continue;
+                    bind_image_alias(i, j, image_start);
+                    break;
+                }
+                if (bi.alias_of != SIZE_MAX) continue;
+            }
             static const uint32_t render_scale = [] {
                 const char* e = std::getenv("PROSPER_RENDER_SCALE");
                 const long v = e ? std::strtol(e, nullptr, 10) : 1;
@@ -6959,41 +7031,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!bi.storage && same_view)
                     same_sampler = prosper::gpu::shader_resource_same_sampler(*p, *r);
                 if (!same_view || !same_sampler) continue;
-                bi.alias_of = prior.alias_of == SIZE_MAX ? j : prior.alias_of;
-                const BoundImage& owner = images[bi.alias_of];
-                bi.image = owner.image; bi.memory = owner.memory; bi.view = owner.view;
-                bi.sampler = owner.sampler; bi.guest_bytes = owner.guest_bytes;
-                bi.texel_depth = owner.texel_depth;
-                bi.array_layers = owner.array_layers;
-                bi.mip_levels = owner.mip_levels;
-                bi.mip_staging_offsets = owner.mip_staging_offsets;
-                bi.dcc_metadata = owner.dcc_metadata;
-                bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
-                staging_bytes[i] = staging_bytes[bi.alias_of];
-                if (trace)
-                    std::fprintf(stderr, "[compute]   image-alias binding=%u -> binding=%u addr=0x%llx\n",
-                                 bi.binding, owner.binding, (unsigned long long)r->gpu_addr);
+                bind_image_alias(i, j, image_start);
                 break;
             }
-            if (bi.alias_of != SIZE_MAX) {
-                const BoundImage& alias_owner = images[bi.alias_of];
-                if (image_timing)
-                    std::fprintf(stderr,
-                                 "[compute-image] code=0x%llx hash=0x%016llx "
-                                 "binding=%u class=%s alias=1 addr=0x%llx alias_of=%u "
-                                 "persistent=%u upload-skipped=%u "
-                                 "extent=%ux%ux%u ms=%.3f\n",
-                                 (unsigned long long)item.code_addr,
-                                 (unsigned long long)timing_program_hash, bi.binding,
-                                 bi.storage ? "storage" : "sampled",
-                                 (unsigned long long)r->gpu_addr, alias_owner.binding,
-                                 alias_owner.persistent ? 1u : 0u,
-                                 alias_owner.upload_skipped ? 1u : 0u,
-                                 r->width, r->height, r->depth,
-                                 std::chrono::duration<double, std::milli>(
-                                     ComputeClock::now() - image_start).count());
-                continue;
-            }
+            if (bi.alias_of != SIZE_MAX) continue;
             const uint32_t sampled_layers = dim_cube_stacked ? 6u
                                             : dim_2d_array ? r->depth : 1u;
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
