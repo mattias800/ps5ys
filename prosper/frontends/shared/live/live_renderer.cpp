@@ -8778,6 +8778,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         resource.cls == RC::Texture && resource.img_dim == 1u &&
                                         sampled_extent_compatible;
                                     if (!direct_bindable) {
+                                        // #3415: `dimension` is 100% of the same-batch CPU readbacks
+                                        // on PPSA03831 (78,528 counts, 158 GB/run), so the ONE number
+                                        // that decides whether the fix is a view type or a real image
+                                        // mismatch is the array layer count. A single-layer array is
+                                        // legally viewable as VK_IMAGE_VIEW_TYPE_2D_ARRAY over an
+                                        // arrayLayers=1 image; a multi-layer one is a different image
+                                        // and no view widening can serve it. Report the shape rather
+                                        // than inferring it.
+                                        if (resource.img_dim != 1u) {
+                                            static const bool shape_log =
+                                                std::getenv("PROSPER_READBACK_DIM_SHAPE") != nullptr;
+                                            if (shape_log) {
+                                                static std::mutex m;
+                                                static std::map<std::tuple<uint32_t, uint32_t,
+                                                                           uint32_t, uint32_t>,
+                                                                uint64_t> rows;
+                                                std::lock_guard<std::mutex> lk(m);
+                                                auto& n = rows[std::make_tuple(
+                                                    resource.img_dim, resource.depth,
+                                                    resource.sample_count,
+                                                    (uint32_t)resource.cls)];
+                                                if (++n % 256 == 0)
+                                                    std::fprintf(stderr,
+                                                        "[readback-dim] img_dim=%u depth=%u "
+                                                        "layers(sample_count)=%u cls=%u extent=%ux%u "
+                                                        "count=%llu\n",
+                                                        resource.img_dim, resource.depth,
+                                                        resource.sample_count,
+                                                        (unsigned)resource.cls, rw, rh,
+                                                        (unsigned long long)n);
+                                            }
+                                        }
                                         result.cpu_needed = true;
                                         result.storage_references +=
                                             resource.cls == RC::StorageImage;
