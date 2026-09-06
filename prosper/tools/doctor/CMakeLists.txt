@@ -66,4 +66,10 @@ if(PROSPER_RENDERDOC_CONTROL)
   target_compile_definitions(renderdoc_control PRIVATE PROSPER_RENDERDOC_CONTROL)
   target_include_directories(renderdoc_control PRIVATE "${RENDERDOC_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(renderdoc_control PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
+  # Same bracket, different subject: this one produces the capture that validates
+  # tools/pixel_history/pixel_history.py against a construction with a known answer.
+  add_executable(pixel_history_capture "${PROSPER_ROOT}/tools/pixel_history/control.c")
+  target_compile_definitions(pixel_history_capture PRIVATE PROSPER_PIXHIST_CAPTURE)
+  target_include_directories(pixel_history_capture PRIVATE "${RENDERDOC_INCLUDE_DIR}")
+  target_link_libraries(pixel_history_capture PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
 endif()

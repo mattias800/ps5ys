@@ -19,6 +19,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-06
+
+### We can now ask a black pixel why it is black, and get an answer
+
+Four causes produce an identical black pixel — nothing drew there, something drew and was rejected,
+the shader ran and computed black, or the shader computed a colour and the store lost it — and they
+send you to four different files. `tools/pixel_history/` names which one, in a single call, per
+event. It is validated against a construction whose answer is known in advance, and that control has
+already caught two things we had assumed about RenderDoc and were wrong about — including it
+reporting a *neighbouring* draw's colour as the shader output of a draw whose fragment never ran.
+We would have believed both on a game capture.
+
 ## 2026-09-05
 
 ### The sheared Unity titles were never sheared — the build directory was
