@@ -4145,6 +4145,15 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             b.export_param(ps_input, xyz_one ? one : zero, xyz_one ? one : zero,
                            xyz_one ? one : zero, w_one ? one : zero);
         }
+        // A PS can read a PARAM that this VS never exports (#3416: a position-only guest VS
+        // paired with a PS reading attr0). Vulkan requires the matching declaration even when
+        // its value is unwritten. Complete only the proven consumed interface; do not invent a
+        // store/default or expand sticky controls into 32 outputs. Real exports and explicit
+        // DEFAULT_VAL controls above still supply their values through the same variables.
+        if (pixel_inputs->consumed_known) {
+            for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input)
+                if (pixel_inputs->consumes(ps_input)) b.vtx_output(ps_input);
+        }
     }
     return b.finish();
 }

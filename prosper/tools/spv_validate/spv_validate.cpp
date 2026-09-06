@@ -389,6 +389,12 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x36020081u,0x2C040081u,0x7E020D01u,0x7E040D02u,0x7E0A02F6u,0x7E0C02F2u,0x10020B01u,
                             0x08020D01u,0x10040B02u,0x08040D02u,0x7E060280u,0x7E0802F2u,0xF80008CFu,0x04030201u,0xBF810000u};
       dump(dir, "vertex_fullscreen", recompile_vertex(c, sizeof(c)/4), "recompile_vertex");
+      PixelInputMapping consumed;
+      consumed.valid_mask = 0xffffffffu;
+      consumed.consumed_known = true;
+      consumed.consumed_mask = 1u;
+      dump(dir, "vertex_unwritten_consumed_param",
+           recompile_vertex(c, sizeof(c)/4, nullptr, &consumed));
       // Geometry-probe capture variant: gl_Position decorated for transform-feedback readback. Must
       // still pass spirv-val (Xfb capability + execution mode + member Offset/XfbBuffer/XfbStride).
       dump(dir, "vertex_xfb_capture", recompile_vertex(c, sizeof(c)/4, nullptr, nullptr, true)); }

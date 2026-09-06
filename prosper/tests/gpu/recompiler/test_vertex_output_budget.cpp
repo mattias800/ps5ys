@@ -72,6 +72,27 @@ PixelInputMapping sticky_all_slots_param0() {
     return mapping;
 }
 
+size_t stores_to_location(const std::vector<uint32_t>& spirv, uint32_t location) {
+    uint32_t variable = 0;
+    for (size_t word = 5; word < spirv.size();) {
+        const uint32_t count = spirv[word] >> 16;
+        if (!count || word + count > spirv.size()) return SIZE_MAX;
+        if ((spirv[word] & 0xffffu) == kOpDecorate && count == 4 &&
+            spirv[word + 2] == kDecorationLocation && spirv[word + 3] == location)
+            variable = spirv[word + 1];
+        word += count;
+    }
+    size_t stores = 0;
+    for (size_t word = 5; word < spirv.size();) {
+        const uint32_t count = spirv[word] >> 16;
+        if (!count || word + count > spirv.size()) return SIZE_MAX;
+        if ((spirv[word] & 0xffffu) == 62 && count >= 3 && spirv[word + 1] == variable)
+            ++stores;
+        word += count;
+    }
+    return stores;
+}
+
 }  // namespace
 
 int main() {
@@ -160,6 +181,22 @@ int main() {
     bool covered = true;
     for (uint32_t location : frag_in) if (!bounded_out.count(location)) covered = false;
     CHECK(covered, "every fragment input location is still produced by the vertex stage");
+
+    // #3416: remove the synthetic PARAM export while retaining the fullscreen position export.
+    // The paired PS still reads location 0. Its interface must exist without manufacturing a value
+    // that the guest VS never wrote, and without adding the other 31 sticky controls.
+    std::vector<uint32_t> position_only(vs, vs + vs_dwords - 3);
+    position_only.push_back(0xbf810000u);
+    const auto missing_param = recompile_vertex(
+        position_only.data(), position_only.size(), nullptr, &bounded);
+    CHECK(!missing_param.empty(), "position-only VS with a consumed PS input recompiles");
+    const auto missing_out = interface_locations(missing_param, kStorageClassOutput);
+    CHECK(missing_out == frag_in && missing_out.size() == 1,
+          "an unexported but consumed parameter still has the required Vulkan interface");
+    CHECK(stores_to_location(missing_param, 0) == 0,
+          "an absent guest PARAM export does not acquire an invented value");
+    CHECK(stores_to_location(bounded_vs, 0) > 0,
+          "a real guest PARAM export still writes the consumed location");
 
     // --- The mutation arm: the pre-fix behaviour, and it must blow the limit -------------------
     PixelInputMapping unbounded = sticky_all_slots_param0();   // consumed_known stays false
