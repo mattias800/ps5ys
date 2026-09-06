@@ -128,6 +128,23 @@ F8 post-trigger timers, F9 captures, debugger stops, frame dumps, and verbose lo
 Use diagnostic runs to find the cause and separate minimally instrumented runs to measure the win.
 For stopped-stack fallback only: [hostprof](../tools/hostprof/README.md).
 
+**Before profiling symbols, divide by the core count.** A process consuming about **one**
+core-second per wall-second on a many-core box is serial, whatever `perf report` then attributes the
+time to — the question stops being "which function" and becomes "why is only one thread doing this".
+Read it from `/proc/<pid>/stat` (utime+stime deltas) or `pidstat`, and take it before the flame
+graph: it is one number, it cannot be misattributed by a truncated unwind, and it rules out a whole
+class of answers. *Sonic Frontiers* at 3.3 fps sat at **1.01 of 32 cores** with `gpu-device` at 5.4%
+of the window, which said "serial host work" before any symbol was read; three serial per-texel
+conversion loops were the cause (#3405).
+
+**A widely used parallel helper is not evidence that the chain you are profiling uses it — count
+the call sites against the loops of that shape.** `parallel_compute_texels` was already live at
+**fifteen** sites in `frontends/shared/live/live_compute.cpp`, which is exactly what makes the gap
+invisible: the *sampled* conversion chain has seven per-texel arms and exactly **one** of them was
+wrapped, so six 4K scalar loops sat among wrapped neighbours and read as parallel to anyone who
+found the helper first. Grep for the helper, then grep for the loop shape it wraps, and compare the
+counts **within the chain you are measuring**, not across the file. #3408.
+
 ### Stalled loading and waits
 
 ```bash
