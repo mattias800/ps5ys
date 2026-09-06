@@ -98,6 +98,23 @@ covered separately by the CPU regression. Its allocation controls fail with the 
 implementations while the property-equivalence checks remain green. Native comparison and exact
 verification evidence are tracked in #3065.
 
+### Constant-time texture binding statistics (#3065)
+
+The next retained native profile (production source equivalent to main `f9188bd39`) contains
+31,373 userspace samples and 52,814,729,223 summed sample periods. Three instruction addresses
+in the exact binary's end-of-pass texture-binding census account for 1,156,672,656 periods:
+**2.19006% of sampled user cycles**, not frame time or a projected FPS gain. That loop walks
+every persistent texture image solely to sum its binding-map size; it is not texture validation
+or upload. Exact-ELF callchains and disassembly distinguish this bookkeeping from those costs.
+
+The backend now maintains the same aggregate under its existing persistent-resource lock:
+successful binding insertion adds one, binding eviction removes one, and image retirement
+subtracts that image's bindings. Invalid content remains counted until actually retired.
+Rendering, upload/validation policy, cache limits and the statistics publication point are
+unchanged. Focused tests cover multiple images, invalid-but-resident content, both eviction
+paths and view/sampler failures before and after eviction. Native comparison evidence and
+the still-open broader resource-preparation budget remain in #3065.
+
 ## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.

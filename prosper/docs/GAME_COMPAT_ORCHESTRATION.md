@@ -47,7 +47,9 @@ this document is the map that helps the next orchestrator find and interpret tha
 - **GTA V native Linux performance (2026-09-06):** #3065 owns the current CPU/resource-budget
   investigation. The Performance Story route renders the bank; its latest instrumented baseline
   is about 6 guest flips/s, not the separate Windows throughput figure. See `GTA5_STATUS.md` for
-  the bounded shader-property scan experiment and the issue for native comparison evidence.
+  the shader-property and constant-time texture-statistics changes, and the issue for native
+  comparison evidence. The latter removes a cache-wide census identified in sampled user CPU;
+  it does not change texture validation or establish an FPS gain.
 
 ### The standing objective, in the user's words
 
