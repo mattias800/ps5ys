@@ -144,24 +144,17 @@ std::vector<fs::path> collect_modules(const std::string& input) {
     return out;
 }
 
-// Every report this tool emits is an ASSERTION OF ABSENCE — "these NIDs have no handler". An
-// absence is only as trustworthy as the population it was measured over, so no output may omit
-// that population. `prefix` is "# " for --tsv (comment lines a consumer skips) and "" for the
-// human report.
-//
-// The two divergences worth stating explicitly, because they SILENTLY REMOVE ROWS:
-//   * a module that failed to parse contributes no imports, so its NIDs read as "not imported
-//     by anything" rather than "not measured";
-//   * this scans the tree for modules, while the loader links a FIXED set (boot_program.cpp) —
-//     it takes exactly two entries from sce_module/, auto-discovers only Media/Plugins/, and
-//     never auto-links .sprx. So a NID satisfied here by a sibling export the loader would not
-//     have linked is excluded from the census but WOULD reach the dispatcher at runtime.
+// Report the population before filtering and the registration state of the shown subset.
+// A module that failed to parse contributes no imports, so its absence must also be explicit.
+// `prefix` is "# " for --tsv (comment lines a consumer skips) and "" for the human report.
 void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
-                 size_t unregistered, size_t shown, size_t satisfied_cross_module,
+                 size_t unregistered, size_t shown, size_t shown_unregistered,
+                 size_t satisfied_cross_module,
                  size_t mismatches, const std::string& lib_filter, bool self_check) {
     printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n",
            prefix, total, modules_read, modules_failed);
-    printf("%sscope: %zu unregistered, %zu shown%s%s\n", prefix, unregistered, shown,
+    printf("%sscope: %zu unregistered before filtering, %zu shown (%zu unregistered)%s%s\n",
+           prefix, unregistered, shown, shown_unregistered,
            lib_filter.empty() ? "" : ", --lib filter=", lib_filter.c_str());
     printf("%sscope: %zu binding(s) excluded as satisfied by a sibling module's export\n",
            prefix, satisfied_cross_module);
@@ -180,9 +173,9 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
            "listed here may never execute, and a fault is not explained by its presence. For what a "
            "run actually called, use prosper_on_unimpl's first-seen census from a live boot, or "
            "hle_calls (#1980), and bound it to the window the behaviour occurs in.\n", prefix);
-    printf("%sNOTE: module set is a tree scan, not the loader's link set (boot_program.cpp): "
-           "only Media/Plugins is auto-discovered, .sprx is never auto-linked, and sce_module "
-           "contributes exactly two. Cross-module exclusions are computed over THIS set.\n",
+    printf("%sNOTE: dump roots use the loader's link set (boot_program.cpp); explicit module "
+           "inputs inspect that module alone. Cross-module exclusions use the modules "
+           "selected for each input.\n",
            prefix);
 }
 
@@ -273,7 +266,7 @@ int main(int argc, char** argv) {
 
     // Classify against the live registry.
     std::vector<Row*> selected;
-    size_t total = 0, unregistered = 0;
+    size_t total = 0, unregistered = 0, shown_unregistered = 0;
     for (auto& [nid, r] : rows) {
         total++;
         const bool registered = Hle::registered(nid);
@@ -288,6 +281,7 @@ int main(int argc, char** argv) {
             if (!hit) continue;
         }
         selected.push_back(&r);
+        if (!registered) shown_unregistered++;
     }
 
     // Most-imported first: the count of distinct titles is the reachability rank.
@@ -309,20 +303,26 @@ int main(int argc, char** argv) {
                    r->titles.size(), r->modules, libs.c_str(), tl.c_str());
         }
         print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
-                    satisfied_cross_module, names.mismatches, lib_filter, self_check);
+                    shown_unregistered, satisfied_cross_module, names.mismatches,
+                    lib_filter, self_check);
         return 0;
     }
 
-    printf("\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
-    printf("%-13s %-52s %5s  %s\n", "NID", "name", "#ttl", "import library");
+    printf("%s", show_registered
+        ? "\n== imports (registered and unregistered) ==\n"
+        : "\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
+    printf("%-13s %-52s %10s %5s  %s\n",
+           "NID", "name", "registered", "#ttl", "import library");
     for (const Row* r : selected) {
         std::string libs;
         for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
-        printf("%-13s %-52s %5zu  %s\n", r->nid.c_str(),
-               r->name.empty() ? "?" : r->name.c_str(), r->titles.size(), libs.c_str());
+        printf("%-13s %-52s %10s %5zu  %s\n", r->nid.c_str(),
+               r->name.empty() ? "?" : r->name.c_str(),
+               Hle::registered(r->nid) ? "yes" : "no", r->titles.size(), libs.c_str());
     }
     printf("\n");
     print_scope("", total, modules_read, modules_failed, unregistered, selected.size(),
-                satisfied_cross_module, names.mismatches, lib_filter, self_check);
+                shown_unregistered, satisfied_cross_module, names.mismatches,
+                lib_filter, self_check);
     return 0;
 }
