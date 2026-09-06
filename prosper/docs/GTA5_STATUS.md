@@ -73,6 +73,31 @@ The phase-report tool's alias records are **not zero work**: this capture has 10
 versus 26.963 ms in real-image records. The report's misleading alias-only wording is tracked in
 #3388. Do not treat its real-image-only decomposition as all image setup.
 
+### Streaming per-draw shader properties (#3065)
+
+A fresh native Performance Story baseline on `7dfcc038` (source tree equal to main `5974d41b5`)
+again rendered the bank at “Go to the guard,” without a device-loss signal. Its complete F8 window
+contained 779 renderer and 2,120 compute records with zero drops and measured 5.98 guest/host
+flips per second over 5.016 seconds. This is an instrumented attribution window, not a new
+progression milestone or an untouched throughput comparison.
+
+The separate userspace CPU profile identified repeated instruction-vector construction in
+`fragment_color_export_mask` and `rdna2_vertex_prolog_info`. These queries now decode directly
+without retaining a full vector: first nonzero export per MRT is unchanged, and prolog branches
+must still target the retained prefix or its exact transfer instruction. Shader translation,
+resource resolution, cache validation and emitted instructions are unchanged. The existing
+dynamic-fetch decode cache is not absent and is not modified by this change.
+
+CPU-only comparison against the previous vector algorithms covered 139 fragment and 88 vertex
+streams extracted from the native F9 frame, with identical property results throughout. Across
+six alternating trials, summing each unique stream's median one-call time gave 1.368 → 0.224 ms
+for fragment masks and 0.215 → 0.00681 ms for vertex-prolog queries. These unweighted corpus totals
+are **not per-frame costs or FPS gains**. All retained vertex streams reject as split prologs;
+accepted transfers, signed branch boundaries, truncated inputs and same-address mutations are
+covered separately by the CPU regression. Its allocation controls fail with the old vector
+implementations while the property-equivalence checks remain green. Native comparison and exact
+verification evidence are tracked in #3065.
+
 ## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.
