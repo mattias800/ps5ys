@@ -4,17 +4,20 @@ import unittest
 import pixel_history as ph
 
 
-def clear(post=(0.0, 0.0, 0.0, 1.0), eid=0):
-    """A clear: passes, evaluates no test, and is never the subject of a verdict."""
-    return ev(True, post=post, eid=eid, is_clear=True)
+def clear(post=(0.0, 0.0, 0.0, 1.0), eid=0, pre=(0.5, 0.5, 0.5, 1.0)):
+    """A clear: passes, evaluates no test, and is never the subject of a verdict.
+
+    `pre` differs from `post` by default, i.e. a clear that actually changed the pixel.
+    """
+    return ev(True, post=post, eid=eid, is_clear=True, pre=pre)
 
 
 def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1, suppressed=None,
-       is_clear=False):
+       is_clear=False, pre=None):
     if suppressed is None:
         suppressed = ph.suppress_shader_output(rejected)
     return {"eventId": eid, "passed": passed, "rejected_by": list(rejected),
-            "is_clear": is_clear,
+            "is_clear": is_clear, "preMod": list(pre if pre is not None else post),
             "shaderOut": None if suppressed else (None if shader is None else list(shader)),
             "shader_output_suppressed": suppressed,
             "postMod": list(post)}
@@ -44,6 +47,13 @@ class ClassifyTests(unittest.TestCase):
                               clear(eid=9)])
         self.assertEqual(v, "CLEARED_AFTER_DRAW")
         self.assertIn("9", why)
+
+    def test_a_clear_that_changed_nothing_does_not_take_the_blame(self):
+        # A late clear whose preMod equals its postMod explains nothing. Blaming it would
+        # move the reader off the draw that actually produced the pixel.
+        v, _ = ph.classify([ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=5),
+                            clear(post=(0, 0, 0, 1), pre=(0, 0, 0, 1), eid=9)])
+        self.assertEqual(v, "SHADER_WROTE_BLACK")
 
     def test_a_clear_before_the_draws_does_not_change_a_real_verdict(self):
         drawn = ev(True, shader=(0.7, 0.2, 0.1, 1), post=(0, 0, 0, 1), eid=5)
@@ -128,7 +138,7 @@ class ControlCheckTests(unittest.TestCase):
                ev(True, shader=(1, 1, 0, 1), post=(1, 1, 0, 1), eid=4),
                ev(False, ["depthTestFailed"], shader=(0, 0, 1, 1), eid=5),
                ev(False, ["scissorClipped"], eid=9)]   # a later region's draw
-        killed = [clear(eid=0), ev(False, ["scissorClipped"], eid=1),
+        killed = [clear(eid=0), clear(eid=3), ev(False, ["scissorClipped"], eid=4),
                   ev(False, ["shaderDiscarded"], shader=(0, 0, 0, 0), eid=8)]
         return {"A  sequence": {"verdict": "PIXEL_WAS_WRITTEN", "events": seq},
                 "A' arm-1 only": {"verdict": "PIXEL_WAS_WRITTEN", "events": []},
@@ -150,11 +160,17 @@ class ControlCheckTests(unittest.TestCase):
                                           if "shaderDiscarded" not in e["rejected_by"]]
         self.assertIn("region's own draw is missing", " ".join(ph.check_control(bad)))
 
-    def test_E_must_contain_a_clear_so_it_guards_trap_269(self):
-        bad = self.regions()
-        bad["E  all killed"]["events"] = [e for e in bad["E  all killed"]["events"]
-                                          if not e["is_clear"]]
-        self.assertIn("trap 269", " ".join(ph.check_control(bad)))
+    def test_E_must_contain_both_clear_forms(self):
+        # One clear is not enough: the transfer clear carries ActionFlags::Clear and the
+        # loadOp clear does not, so a reading with only the flagged one stays green while
+        # every loadOp clear in a real capture goes unrecognised.
+        for keep in (0, 1):
+            bad = self.regions()
+            cs = [e for e in bad["E  all killed"]["events"] if e["is_clear"]]
+            bad["E  all killed"]["events"] = [
+                e for e in bad["E  all killed"]["events"]
+                if not e["is_clear"] or e["eventId"] == cs[keep]["eventId"]]
+            self.assertIn("expected 2", " ".join(ph.check_control(bad)))
 
     def test_correct_reading_passes(self):
         self.assertEqual(ph.check_control(self.regions()), [])

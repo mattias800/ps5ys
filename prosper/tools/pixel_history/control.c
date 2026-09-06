@@ -233,10 +233,19 @@ int main(void)
     VkAttachmentDescription att[2] = {{0}, {0}};
     att[0].format = VK_FORMAT_R8G8B8A8_UNORM;
     att[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    /* LOAD, not CLEAR: a render-pass clear is itself a pixel-history event that passes at
-     * every pixel, which would make ALL_REJECTED unconstructible. The black ground comes
-     * from a transfer clear before the pass instead. */
-    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    /* BOTH clear forms appear in this capture on purpose, because RenderDoc records them
+     * differently and a control that exercises only one validates only one:
+     *
+     *   vkCmdClearColorImage  -> ActionFlags::Clear AND ResourceUsage::Clear
+     *   loadOp = CLEAR        -> ResourceUsage::Clear ONLY; its action carries
+     *                            PassBoundary|BeginPass (vk_cmd_funcs.cpp:2336 vs :2351)
+     *
+     * Keying on the flag missed the second, which is the common form in a real renderer, so
+     * a loadOp-cleared black target read SHADER_WROTE_BLACK. The transfer clear below paints
+     * dark red; this loadOp clear then establishes the black ground. Both land in every
+     * pixel's history, so E's check can require two clears and fail if either detection
+     * path is lost. */
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -427,7 +436,7 @@ int main(void)
     cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbi);
 
-    /* Black ground by transfer clear, INSIDE the capture on purpose.
+    /* Ground clears INSIDE the capture on purpose.
      *
      * MEASURED, not assumed: RenderDoc's Vulkan pixel history reports vkCmdClearColorImage
      * as a PASSING modification, with no test evaluated (trap 269). That briefly made
@@ -451,7 +460,9 @@ int main(void)
     pre.subresourceRange.layerCount = 1;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &pre);
-    VkClearColorValue black = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    /* Deliberately NOT black: if this transfer clear were ever the event a verdict rested
+     * on, a black value would hide the mistake behind the right answer. */
+    VkClearColorValue black = {{0.25f, 0.0f, 0.0f, 1.0f}};
     vkCmdClearColorImage(cmd, color_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black,
                          1, &pre.subresourceRange);
     pre.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;

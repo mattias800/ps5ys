@@ -103,8 +103,13 @@ def classify(events):
     # A clear AFTER the last surviving draw is what the reader is looking at, not the draw.
     # Blaming the shader for a pixel a later clear wiped is the same error as blaming it for
     # the ground clear, one ordering along.
+    # A clear that did not change the pixel explains nothing, so it must not take the blame
+    # from the draw that did. eventId ordering is RenderDoc's own submission order and is
+    # what PixelModification sorts by; it is not meaningful ACROSS queues, a limitation this
+    # inherits from pixel history rather than introduces.
     late = [e for e in events if e["is_clear"] and e["passed"]
-            and e["eventId"] > passed[-1]["eventId"]]
+            and e["eventId"] > passed[-1]["eventId"]
+            and e["preMod"][:3] != e["postMod"][:3]]
     if late:
         return "CLEARED_AFTER_DRAW", (
             f"{len(passed)} draw(s) passed, then event {late[-1]['eventId']} cleared the "
@@ -162,16 +167,11 @@ def embedded():
                 "would be indistinguishable from 'nothing drew', so refusing to report one")
 
         actions = []
-        clear_eids = set()
 
         def walk(nodes):
             for a in nodes:
                 if a.flags & rd.ActionFlags.Drawcall:
                     actions.append(a)
-                # Trap 269: a clear is a passing pixel-history event. classify() must be able
-                # to tell it from a draw, and only the action list carries that.
-                if a.flags & rd.ActionFlags.Clear:
-                    clear_eids.add(int(a.eventId))
                 walk(a.children)
 
         walk(ctl.GetRootActions())
@@ -232,6 +232,17 @@ def embedded():
                 except Exception as exc:
                     how = f"centre (content guidance unavailable: {exc})"
 
+        # Which events CLEARED this target. Keyed on ResourceUsage, not ActionFlags, because
+        # they are not the same set and the difference is the common case: a renderpass
+        # `loadOp = CLEAR` records ResourceUsage::Clear (vk_cmd_funcs.cpp:2336) while its
+        # action carries only PassBoundary|BeginPass (:2351) -- ActionFlags::Clear is set
+        # solely by vk_draw_funcs.cpp, i.e. vkCmdClear*. Keying on the flag therefore missed
+        # every loadOp clear, and a loadOp-cleared black target that nothing drew to was
+        # reported as SHADER_WROTE_BLACK: the exact string this distinction exists to stop.
+        # This is character-for-character RenderDoc's own predicate (vk_pixelhistory.cpp:4636).
+        clear_eids = {int(u.eventId) for u in ctl.GetUsage(tex.resourceId)
+                      if u.usage == rd.ResourceUsage.Clear}
+
         if not (0 <= pixel[0] < tex.width and 0 <= pixel[1] < tex.height):
             raise RuntimeError(
                 f"pixel {tuple(pixel)} is outside the {tex.width}x{tex.height} target; an "
@@ -251,6 +262,7 @@ def embedded():
                 # nothing" and "the shader never ran" are different findings.
                 "shaderOut": None if pre else values(m.shaderOut),
                 "shader_output_suppressed": pre,
+                "preMod": values(m.preMod),
                 "postMod": values(m.postMod),
             })
         verdict, reason = classify(events)
@@ -269,6 +281,7 @@ def embedded():
                                "rejected_by": rej,
                                "shaderOut": None if pre else values(m.shaderOut),
                                "shader_output_suppressed": pre,
+                               "preMod": values(m.preMod),
                                "postMod": values(m.postMod)})
                 control[name] = {"verdict": classify(ce)[0], "events": ce}
 
@@ -351,9 +364,16 @@ def check_control(regions):
                             "and its verdict is coming from scissored neighbours alone")
         # E is the control's guard for trap 269. If the clear stopped being recognised, its
         # verdict would silently become SHADER_WROTE_BLACK with the clear as the subject.
-        if not any(e["is_clear"] for e in killed["events"]):
-            problems.append("E: no clear event in the history, so this reading cannot guard "
-                            "the clear-versus-draw distinction (trap 269) at all")
+        clears = [e for e in killed["events"] if e["is_clear"]]
+        # TWO clears, because the control builds two FORMS of clear and they are recorded
+        # differently: vkCmdClearColorImage carries ActionFlags::Clear, a loadOp clear does
+        # not. Requiring only one let the flag-keyed detection pass while every loadOp clear
+        # in a real capture went unrecognised.
+        if len(clears) < 2:
+            problems.append(f"E: {len(clears)} clear event(s) recognised, expected 2 (the "
+                            f"transfer clear and the renderpass loadOp clear). One detection "
+                            f"path is broken; loadOp clears are the common form and carry "
+                            f"ResourceUsage::Clear but NOT ActionFlags::Clear")
     return problems
 
 

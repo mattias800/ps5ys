@@ -34,21 +34,34 @@ What lives here:
 
 ## The control is not ceremony
 
-It has earned itself **twice**, and both times against an assumption that looked safe.
+It has earned itself **three times**, every time against an assumption that looked safe — and
+each one was written down as a confident comment before it was measured.
 
 1. **RenderDoc populates `shaderOut` for events whose fragment shader never ran** — a scissored
    draw reports the *previous* draw's colour. On a game capture that is invisible: the number
    looks like a shader output and there is nothing to check it against. The control caught it
    because the value belonged to a draw whose colour was known to be different. Instrument
    trap 268.
-2. **A `vkCmdClearColorImage` IS a pixel-history event, and it passes.** The control's own
-   comment had asserted the opposite. A region whose every draw was discarded read
-   `SHADER_WROTE_BLACK` instead of `ALL_REJECTED`, because the clear sat in its history as a
-   passing black event. The clear now happens before the capture starts. Instrument trap 269.
+2. **A clear IS a pixel-history event, and it passes.** The control's own comment had asserted
+   the opposite. A region whose every draw was discarded read `SHADER_WROTE_BLACK` instead of
+   `ALL_REJECTED`, because the clear sat in its history as a passing black event.
+3. **And the two kinds of clear are not the same set.** Having keyed the fix on
+   `ActionFlags::Clear`, a renderpass `loadOp = CLEAR` — the *common* form — still read
+   `SHADER_WROTE_BLACK`, because it records `ResourceUsage::Clear` but carries no
+   `ActionFlags::Clear`. The control could not see it, because it built only the flagged form:
+   **it was validating the path the code handled.** It now builds both, and the check fails if
+   either detection path is lost. Instrument trap 269.
 
-Generalise from both: **a tool that reads a value cannot tell you the value is meaningful.**
-Only a construction whose answer you already know can. Note that in each case the wrong belief
-was written down as a confident comment first — reasoning about an API is not measuring it.
+Generalise: **a tool that reads a value cannot tell you the value is meaningful.** Only a
+construction whose answer you already know can — and only if that construction contains the hard
+case. The first attempt at (2) fixed the control by moving the clear out of the captured frame,
+which made it pass by removing the phenomenon. That is the failure mode to watch for: a control
+that has been adjusted until it agrees with the code is no longer evidence about the code.
+
+Event ids order events by submission and are what `PixelModification` sorts by, so the
+"a clear landed after the last surviving draw" test is sound within one queue. It is not
+meaningful across queues — a limitation inherited from RenderDoc's pixel history, not introduced
+here.
 
 ## Boundary
 
