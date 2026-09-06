@@ -3036,7 +3036,8 @@ if(TARGET prosper_core)
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       target_include_directories(test_texture_sample_render PRIVATE frontends)
       target_link_libraries(test_texture_sample_render PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME texture_sample_render COMMAND test_texture_sample_render)
+      add_test(NAME texture_sample_render COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB $<TARGET_FILE:test_texture_sample_render>)
 
       # Multi-draw backend: N draws composited into ONE cleared-once framebuffer (red opaque + green
       # additive -> yellow center proves accumulation into a single target).

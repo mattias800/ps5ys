@@ -309,6 +309,8 @@ int main() {
         std::vector<uint8_t> warm_px;
         const std::string warm_log = render(make_draw(0.0f), RenderVkObjectCreateSite::None,
                                             "warm", &warm_px);
+        const size_t warm_binding_entries =
+            prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries;
         CHECK(center_red(warm_px) > 0xC0 && !has(warm_log, "[render-object-create-failed]"),
               "persistent texture: the warming render succeeds and is silent");
 
@@ -323,6 +325,9 @@ int main() {
               "texture-view-persistent: the failure names its own site, API and VkResult");
         CHECK(pv_px.size() == static_cast<size_t>(W) * H * 4 && center_red(pv_px) < 0x20,
               "texture-view-persistent: the draw is skipped rather than caching a null view");
+        CHECK(prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries ==
+                  warm_binding_entries,
+              "failed persistent view creation adds no binding to the exact aggregate");
 
         // A DIFFERENT sampler contract is a different binding key, so this misses the binding
         // cache too and reaches the same pair. Fail the sampler this time.
@@ -335,6 +340,9 @@ int main() {
               "texture-sampler-persistent: the failure names its own site, API and VkResult");
         CHECK(psm_px.size() == static_cast<size_t>(W) * H * 4 && center_red(psm_px) < 0x20,
               "texture-sampler-persistent: the draw is skipped rather than caching a null sampler");
+        CHECK(prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries ==
+                  warm_binding_entries,
+              "failed persistent sampler creation adds no binding despite successful view creation");
 
         // THE POINT OF THIS BLOCK. Before #3210 the two persistent sites emplaced whatever the
         // failed create left behind into PersistentTextureImage::bindings, so ONE failure was
@@ -354,10 +362,12 @@ int main() {
                   !has(recovered_log_a, "[render-object-create-failed]"),
               "a later draw with the FAILED binding key renders -- no null was cached");
         CHECK(after_a.persistent_texture_binding_misses == 1 &&
-                  after_a.persistent_texture_binding_hits == 0,
+                  after_a.persistent_texture_binding_hits == 0 &&
+                  after_a.persistent_texture_binding_entries == warm_binding_entries + 1,
               "...and it had to re-create the binding, proving the failure left no entry behind");
         CHECK(after_b.persistent_texture_binding_hits == 1 &&
-                  after_b.persistent_texture_binding_misses == 0 && recovered_a == recovered_b,
+                  after_b.persistent_texture_binding_misses == 0 && recovered_a == recovered_b &&
+                  after_b.persistent_texture_binding_entries == warm_binding_entries + 1,
               "the re-created binding is then cached and re-served byte-identically");
 
         std::vector<uint8_t> psm_recovered;
@@ -367,6 +377,45 @@ int main() {
         CHECK(center_red(psm_recovered) > 0xC0 &&
                   !has(psm_recovered_log, "[render-object-create-failed]"),
               "the sampler-failure binding key likewise re-creates cleanly on the next draw");
+        CHECK(prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries ==
+                  warm_binding_entries + 2,
+              "recovering the second failed key contributes exactly one additional binding");
+
+        // Failure AFTER eviction is a different transaction: the removed old binding stays gone
+        // even when its replacement cannot be created. Fill the remaining 30 contracts first.
+        for (uint32_t i = 2; i < 32; ++i) {
+            std::vector<uint8_t> fill_px;
+            const std::string fill_log = render(make_draw(static_cast<float>(i) / 64.0f),
+                RenderVkObjectCreateSite::None, "fill_binding_limit", &fill_px);
+            CHECK(center_red(fill_px) > 0xC0 && !has(fill_log, "[render-object-create-failed]") &&
+                      prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries ==
+                          warm_binding_entries + i + 1,
+                  "fill to 32 valid contracts increments the aggregate one binding at a time");
+        }
+        for (uint32_t i = 32; i < 34; ++i) {
+            const auto site = i == 32 ? RenderVkObjectCreateSite::TextureViewPersistent
+                                      : RenderVkObjectCreateSite::TextureSamplerPersistent;
+            const char* site_log = i == 32 ? "site=texture-view-persistent"
+                                           : "site=texture-sampler-persistent";
+            const auto full_cache_draw = make_draw(static_cast<float>(i) / 64.0f);
+            std::vector<uint8_t> failed_px;
+            const std::string failed_log = render(full_cache_draw, site, "failure_after_eviction", &failed_px);
+            const auto failed_stats = prosper::test::backend_resource_reuse_stats();
+            CHECK(has(failed_log, site_log) && center_red(failed_px) < 0x20 &&
+                      failed_px.size() == static_cast<size_t>(W) * H * 4 &&
+                      failed_stats.persistent_texture_binding_entries == warm_binding_entries + 31 &&
+                      failed_stats.persistent_texture_binding_evictions == 1,
+                  "evict then fail view/sampler creation leaves exactly 31 owned bindings");
+            std::vector<uint8_t> repaired_px;
+            const std::string repaired_log = render(full_cache_draw, RenderVkObjectCreateSite::None,
+                "repair_after_eviction", &repaired_px);
+            const auto repaired_stats = prosper::test::backend_resource_reuse_stats();
+            CHECK(repaired_px == recovered_a && !has(repaired_log, "[render-object-create-failed]") &&
+                      repaired_stats.persistent_texture_binding_entries == warm_binding_entries + 32 &&
+                      repaired_stats.persistent_texture_binding_misses == 1 &&
+                      repaired_stats.persistent_texture_binding_evictions == 0,
+                  "retry inserts one binding into the vacant slot without a second eviction");
+        }
     }
 
     // ---- Deliberately unaffected: a STORAGE image has no sampler, and must not be dropped ----
