@@ -71,8 +71,10 @@
 VUID-VkComputePipelineCreateInfo-layout-07987 | required | game_compute_exec, game_compute_exec_no_adaptive_storage_result, game_compute_exec_scratch_poison | Compute module declares a PushConstant block while the layout declares no range (#1710)
 VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exec, game_compute_exec_no_adaptive_storage_result, game_compute_exec_scratch_poison | Same root cause as 07987: the shader reads push constants that vkCmdPushConstants never wrote (#1710). Absent on the CI runner because validation layers 1.3.275 do not implement this check.
 
-# ---- #1712: Int64 capability declared, shaderInt64 never enabled on any device ------------------
-VUID-VkShaderModuleCreateInfo-pCode-08740 | required | rdna2_to_spirv_exec, texture_sample_render | Recompiled 64-bit integer ops force OpCapability Int64, which no device-creation path in the tree requests (#1712)
+# ---- 08740: the old #1712 Int64 reason became stale when shaderInt64 was enabled.
+# The remaining texture_sample_render report was ImageGatherExtended, fixed by #3417.
+# A control disabling only shaderImageGatherExtended restores 08740 while pixel assertions still
+# pass; restoring the feature removes the validation error. Remove the entry, so recurrence fails.
 
 # ---- #1714: FIXED. independentBlend is now requested when the device advertises it, so the
 # per-attachment blend state we build is legal and this id no longer fires. The scan's `required`

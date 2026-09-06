@@ -148,13 +148,13 @@ change touching descriptor counts, descriptor-set layouts, or pipeline keys.**
 
 That trigger list is the shape of the one defect this guard has caught **during review, with every
 other check on the PR already green** — which is a narrower claim than "the one defect it has caught",
-and the narrowness is the point. The six entries in `allowlist.txt` (#1710, #1712, #1713, #1714,
-#1715, #1716, #1717, #1726) are also findings this guard surfaced, but they are pre-existing
-conditions catalogued when it was switched on (#1704). #2471 is different in kind: it arrived *inside*
+and the narrowness is the point. The defects catalogued in `allowlist.txt` are also findings this
+guard surfaced; fixed entries are removed as their errors disappear. The remaining entries cover
+#1710, #1715, and #1716. #2471 is different in kind: it arrived *inside*
 a change under active review. That is what justifies running it yourself rather than trusting CI.
 
-**So treat the list as a floor, not a ceiling.** It is derived from a single case, and those six
-allow-listed IDs are evidence nobody has mined for what else belongs on it. Start here; do not read it
+**So treat the list as a floor, not a ceiling.** It is derived from a single case, and the
+allow-listed IDs are evidence to examine for what else belongs on it. Start here; do not read it
 as complete.
 
 The case, and why nothing else could see it:
