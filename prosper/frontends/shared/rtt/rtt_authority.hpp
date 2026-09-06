@@ -12,27 +12,33 @@ namespace prosper::frontend {
 // is a mirror produced by an ordered readback (or the matching CPU result of the same render pass),
 // so sampling the image remains safe. Guest writes erase the cache entry and CPU-only publications
 // explicitly clear gpu_valid before an importer can observe them.
-// #3407. A compute descriptor may sample a renderer colour target as RGBA8_UINT while the renderer
-// created it RGBA8_UNORM -- the same eight bits per channel, differently interpreted. Binding the
-// renderer's image in place then needs VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT on that image, and the
-// fallback when it is absent is a full GPU->CPU readback, a single-threaded reinterpretation and a
-// re-upload of bytes that never needed to move.
+// #3407 -- FALSIFIED, DEFAULT OFF. Do not turn this on expecting it to work.
 //
-// TWO call sites must agree and they live in different translation units: the renderer decides
-// whether to create its colour targets mutable (`create_color_target_image`), and compute decides
-// whether to request such a view (`direct_sampled_rtt_compatible`). Admitting the pair over an
-// image that was not created to allow it would ask Vulkan for an illegal view, so this is
-// deliberately ONE reader in a header both already depend on rather than two `getenv` calls that
-// can drift apart.
+// The hypothesis was that RGBA8_UINT and RGBA8_UNORM are "the same eight bits per channel,
+// differently interpreted", so a compute descriptor declaring UINT could bind a renderer colour
+// target in place instead of round-tripping 33 MB through the CPU. The plumbing works exactly as
+// intended -- 546 in-place binds, zero readbacks, zero CPU conversions, and the distinct-frame rate
+// roughly tripled in a three-per-arm A/B.
+//
+// It renders WRONG COLOURS. Observed directly by the project owner on PPSA03831, 2026-09-06: the
+// SEGA logo, the intro FMV, the third-party logos and the auto-save notice are all corrupted --
+// "everything except black", which is the signature of a value-space error, since 0 maps to 0 under
+// either interpretation.
+//
+// The premise was false for SAMPLING even though it is true of STORAGE. A UNORM sampler returns
+// byte/255 as a float in [0,1]; a UINT view hands the shader the integer 0-255. The CPU arm this
+// bypassed (`upload[t * n + c] = ...` in live_compute.cpp's sampled conversion chain) was doing real
+// work, not moving bytes that never needed to move. A faster frame that renders wrong is a
+// regression, so this stays off.
+//
+// Kept, rather than deleted, ONLY so the A/B that falsified it stays reproducible -- the same reason
+// PROSPER_UD_TAIL_ALIGN survives. Anyone reopening this needs a value-correct path (a GPU-side
+// conversion, or a UNORM view plus a shader-side scale), not this switch.
 inline bool rtt_mutable_format_enabled() {
-    static const bool enabled = std::getenv("PROSPER_NO_RTT_MUTABLE_FORMAT") == nullptr;
+    static const bool enabled = std::getenv("PROSPER_RTT_MUTABLE_FORMAT") != nullptr;
     return enabled;
 }
 
-// Set during device creation when VK_KHR_image_format_list was enabled (core in Vulkan 1.2; this
-// backend requests a 1.1 instance, so it is taken as a device extension when present). Naming the
-// complete view-format set lets a driver keep DCC on a mutable image instead of conservatively
-// dropping compression for an unknown future view.
 inline bool& rtt_image_format_list_available() {
     static bool available = false;
     return available;

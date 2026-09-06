@@ -143,6 +143,16 @@ read. The cause was three separate single-threaded stretches and only one of the
 staging mapping torn down and refaulted every frame (#3406), six unparallelised per-texel conversion
 arms, and a single-threaded 33 MB staging memcpy (both #3408). #3405.
 
+**A frame-rate harness cannot see a wrong frame, so a render change needs a correctness arm or it
+is unmeasured.** This is not a caution, it is a measured failure: a #3407 change was validated by
+six A/B runs, a mechanism check (546 in-place binds, zero readbacks, zero conversions) and an
+absolute rate measurement, all green and mutually consistent — and it rendered corrupted colour on
+every logo, movie and notice in the title. Every one of those instruments counted FRAMES, and a
+corrupted frame is exactly as `distinct` as a correct one. The defect was found in about ninety
+seconds by a person looking at the screen. So before believing a rendering speedup, put one
+correctness check in the same run: a `tools/snapshot` guard, a reviewed frame capture, or a human.
+Prefer that over adding a seventh timing arm. #3407.
+
 **A cache that reaches its entries and authorizes nothing is a workload finding, not a bug — but
 check which it is before believing either.** A hit-rate of exactly zero is worth suspecting: it is
 what a broken lever and an uncachable workload both look like. Print the two identities being
