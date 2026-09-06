@@ -143,6 +143,15 @@ read. The cause was three separate single-threaded stretches and only one of the
 staging mapping torn down and refaulted every frame (#3406), six unparallelised per-texel conversion
 arms, and a single-threaded 33 MB staging memcpy (both #3408). #3405.
 
+**A cache that reaches its entries and authorizes nothing is a workload finding, not a bug — but
+check which it is before believing either.** A hit-rate of exactly zero is worth suspecting: it is
+what a broken lever and an uncachable workload both look like. Print the two identities being
+compared and the entry's validity flag, and one run separates them. On *Sonic Frontiers* the cache
+was reached 1114 times with 0 hits; the trace showed the entry was valid every time and the cached
+key was always the PREVIOUS read's — i.e. the producer republishes between every read, so nothing
+consumer-side could ever hit. That sent the investigation one layer up, to a renderer that was
+re-reading 33 MB off the GPU per read (`PROSPER_RTT_REMAT_LOG`). #3407.
+
 **A widely used parallel helper is not evidence that the chain you are profiling uses it — count
 the call sites against the loops of that shape.** `parallel_compute_texels` was already live at
 **fourteen** call sites in `frontends/shared/live/live_compute.cpp`, which is exactly what makes the
