@@ -6223,6 +6223,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     static std::unordered_map<PersistentTextureKey, PersistentTextureImage,
                               PersistentTextureKeyHash> persistent_texture_images;
     static VkDeviceSize persistent_texture_bytes = 0;
+    // Exact sum of each retained image's binding count. This domain is protected by the
+    // BackendPersistentResourceGuard above; update on successful insertion/erasure, not on
+    // content invalidation (which leaves the bindings resident until the image is retired).
+    // Recounting every cached image after every pass made statistics an O(cache size) hot loop.
+    static size_t persistent_texture_binding_entries = 0;
     static uint64_t persistent_texture_generation = 0;
     constexpr size_t persistent_texture_max_entries = 1024;
     const uint64_t texture_generation = ++persistent_texture_generation;
@@ -7614,6 +7619,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 if (cached->second.memory)
                                     vkFreeMemory(dev, cached->second.memory, nullptr);
                                 persistent_texture_bytes -= cached->second.bytes;
+                                persistent_texture_binding_entries -= cached->second.bindings.size();
                                 persistent_texture_images.erase(cached);
                                 cached = persistent_texture_images.end();
                             }
@@ -7963,6 +7969,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                         if (victim->second.view)
                                             vkDestroyImageView(dev, victim->second.view, nullptr);
                                         persistent_image->second.bindings.erase(victim);
+                                        --persistent_texture_binding_entries;
                                         ++resource_reuse_stats.persistent_texture_binding_evictions;
                                     }
                                 }
@@ -7996,9 +8003,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 }
                                 if (persistent_image->second.bindings.size() <
                                     max_bindings_per_texture) {
-                                    persistent_image->second.bindings.emplace(
-                                        binding_key, PersistentTextureBinding{
-                                            binding.view, binding.sampler, texture_generation});
+                                    const auto [entry, inserted] =
+                                        persistent_image->second.bindings.emplace(
+                                            binding_key, PersistentTextureBinding{
+                                                binding.view, binding.sampler, texture_generation});
+                                    (void)entry;
+                                    if (inserted) ++persistent_texture_binding_entries;
                                     binding.persistent = true;
                                 }
                             }
@@ -9836,6 +9846,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyImage(dev, victim->second.image, nullptr);
         vkFreeMemory(dev, victim->second.memory, nullptr);
         persistent_texture_bytes -= victim->second.bytes;
+        persistent_texture_binding_entries -= victim->second.bindings.size();
         persistent_texture_images.erase(victim);
         return true;
     };
@@ -9872,8 +9883,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (!avoid_cache_eviction)
         while (persistent_texture_bytes > persistent_texture_limit &&
                evict_persistent_texture()) {}
-    for (const auto& [key, image] : persistent_texture_images)
-        resource_reuse_stats.persistent_texture_binding_entries += image.bindings.size();
+    resource_reuse_stats.persistent_texture_binding_entries = persistent_texture_binding_entries;
     texture_stats.persistent_cached_bytes = persistent_texture_bytes;
 
     const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};

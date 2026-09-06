@@ -15,6 +15,10 @@ capture/replay without requiring an importable system Python module.
   the artwork (instrument trap 230). `python3 tools/evidence/prerender_check.py <shot> <DUMP_ROOT>`;
   exit 2 = the frame IS game artwork and is not progression evidence, exit 1 = the check could not
   run and must not be read as a pass.
+- **`profiling_access/`** — optional host-only, scheduler-only autonomous recording via a
+  root-owned helper and a narrowly scoped sudo rule. One administrator installation; thereafter
+  `profile.py` runs unprivileged and uses `sudo -n`. No arbitrary commands, output paths or perf
+  options cross the privilege boundary. See its README for limits, verification and removal.
 - **`verify-pr.ps1`** - author-owned PR verification orchestrator for the Windows+WSL development
   environment. Run it only from a clean, pushed PR head: `docs` records the diff check, `core` adds
   Linux and Windows build+ctest, and `renderer -Snapshot NAME` also runs the selected real-game guard

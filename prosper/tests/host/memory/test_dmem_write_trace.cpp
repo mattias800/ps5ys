@@ -67,6 +67,29 @@ void dynamic_protection_hook() {
     dynamic_protection_helper_entries.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Kernel copies obey the real VMA permissions without entering our SIGSEGV handler. Probe both
+// directions: rejecting a write alone cannot distinguish the requested RO from accidental NONE.
+void check_kernel_permissions(uint8_t* address, bool readable, bool writable) {
+    int probe[2] = {-1, -1};
+    const int opened = pipe(probe);
+    CHECK(opened == 0, "permission probe pipe created");
+    if (opened != 0) return;
+    const uint8_t payload = 0x31;
+    CHECK(write(probe[1], &payload, 1) == 1, "permission probe payload queued");
+    errno = 0;
+    const ssize_t copied_to_page = read(probe[0], address, 1);
+    const int write_error = errno;
+    CHECK(writable ? copied_to_page == 1 : copied_to_page == -1 && write_error == EFAULT,
+          "kernel write probe matches requested alias permission");
+    errno = 0;
+    const ssize_t copied_from_page = write(probe[1], address, 1);
+    const int read_error = errno;
+    CHECK(readable ? copied_from_page == 1 : copied_from_page == -1 && read_error == EFAULT,
+          "kernel read probe distinguishes requested RO from NONE");
+    close(probe[0]);
+    close(probe[1]);
+}
+
 void trace_signal_handler(int sig, siginfo_t* info, void* raw_context) {
     auto* context = static_cast<ucontext_t*>(raw_context);
     const int64_t tid = static_cast<int64_t>(syscall(SYS_gettid));
@@ -780,6 +803,211 @@ int main() {
             reinterpret_cast<uint64_t>(occurrence_two_mapping), allocation_size);
         munmap(occurrence_two_mapping, allocation_size);
     }
+    // #3387: a successful guest mprotect precedes the notification on POSIX. Neither the diagnostic
+    // nor a co-owning production watch may restore the changed alias's OLD writable protection.
+    // Real shared backing, not merely equal registry IDs, also makes the stepping store meaningful.
+    for (const bool stepping : {false, true}) {
+        for (const bool with_production : {false, true}) {
+            for (const int downgraded_prot : {PROT_READ, PROT_NONE}) {
+                std::fprintf(stderr, "[trace-protection] stepping=%d production=%d protection=%d\n",
+                             stepping, with_production, downgraded_prot);
+                const int backing = static_cast<int>(syscall(SYS_memfd_create,
+                                                             "trace-protection", 0));
+                CHECK(backing >= 0, "create shared trace-protection backing");
+                if (backing < 0) continue;
+                const int sized = ftruncate(backing, allocation_size);
+                CHECK(sized == 0, "size shared trace-protection backing");
+                if (sized != 0) { close(backing); continue; }
+                auto* writer_alias = static_cast<uint8_t*>(mmap(
+                    nullptr, allocation_size, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0));
+                auto* changed_alias = static_cast<uint8_t*>(mmap(
+                    nullptr, allocation_size, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0));
+                close(backing);
+                CHECK(writer_alias != MAP_FAILED && changed_alias != MAP_FAILED,
+                      "map two actual shared aliases for protection control");
+                if (writer_alias == MAP_FAILED || changed_alias == MAP_FAILED) {
+                    if (writer_alias != MAP_FAILED) munmap(writer_alias, allocation_size);
+                    if (changed_alias != MAP_FAILED) munmap(changed_alias, allocation_size);
+                    continue;
+                }
+                std::memset(writer_alias, 0x31, allocation_size);
+                CHECK(changed_alias[offset] == 0x31, "protection control aliases share bytes");
+                CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+                      "reset selector for alias-protection control");
+                // Record both aliases before selecting the allocation, avoiding a late-map gap.
+                constexpr uint64_t protection_physical = 0x980000;
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(writer_alias), allocation_size,
+                    protection_physical, 0x3);
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(changed_alias), allocation_size,
+                    protection_physical, 0x3);
+                prosper::host::guest_dmem_write_trace_notify_allocation(
+                    protection_physical, allocation_size, chain);
+                CHECK(prosper::host::guest_dmem_write_trace_snapshot().status ==
+                          prosper::host::GuestDmemWriteTraceStatus::Armed,
+                      "complete alias set arms protection-control trace");
+                prosper::host::GuestWriteWatch shared_owner;
+                if (with_production) {
+                    shared_owner = prosper::host::GuestWriteWatch::create(
+                        reinterpret_cast<uint64_t>(writer_alias + offset), bytes);
+                    CHECK(static_cast<bool>(shared_owner),
+                          "production owner shares the diagnostic physical page");
+                }
+                std::thread pending_writer;
+                std::atomic<int64_t> pending_tid{0};
+                volatile sig_atomic_t protection_marker = 0;
+                if (stepping) {
+                    pause_invalidation_step.store(true, std::memory_order_release);
+                    invalidation_step_ready.store(false, std::memory_order_release);
+                    release_invalidation_step.store(false, std::memory_order_release);
+                    invalidation_canary_active.store(true, std::memory_order_release);
+                    last_step_action.store(-1, std::memory_order_release);
+                    pending_writer = std::thread([&] {
+                        install_altstack();
+                        pending_tid.store(static_cast<int64_t>(syscall(SYS_gettid)),
+                                          std::memory_order_release);
+                        store_byte_then_mark(writer_alias + offset, 0x67, &protection_marker);
+                    });
+                    while (!invalidation_step_ready.load(std::memory_order_acquire)) sched_yield();
+                }
+                // Downgrade only the NON-faulting sibling. The pending writer's original store
+                // remains legal; revoking its own VA would test a different guest protection fault.
+                const int protected_result = mprotect(changed_alias + page, page, downgraded_prot);
+                CHECK(protected_result == 0, "apply actual sibling alias permission downgrade");
+                if (protected_result == 0)
+                    prosper::host::guest_write_watch_notify_direct_mapping_protection(
+                        reinterpret_cast<uint64_t>(changed_alias + page), page,
+                        downgraded_prot == PROT_READ ? 0x1 : 0x0);
+                const auto pending = prosper::host::guest_dmem_write_trace_snapshot();
+                CHECK(pending.status == (stepping ? prosper::host::GuestDmemWriteTraceStatus::Stepping
+                                                 : prosper::host::GuestDmemWriteTraceStatus::Invalid) &&
+                          pending.invalid_reason ==
+                              prosper::host::GuestDmemWriteTraceInvalidReason::MappingProtectionChanged &&
+                          pending.event_count == 0,
+                      "protection change invalidates trace without losing a pending TF owner");
+                check_kernel_permissions(changed_alias + offset, downgraded_prot == PROT_READ, false);
+                if (stepping) {
+                    // The retained trace alias must not turn a new, genuine permission fault into
+                    // a stale queued-fault Resume while another thread owns the original TF window.
+                    const auto revoked_fault = prosper::host::guest_write_watch_handle_fault_ex(
+                        reinterpret_cast<uint64_t>(changed_alias + offset), 0,
+                        static_cast<int64_t>(syscall(SYS_gettid)), false);
+                    const auto after_revoked_fault = prosper::host::guest_dmem_write_trace_snapshot();
+                    CHECK(revoked_fault == prosper::host::GuestWriteWatchFaultAction::NotHandled &&
+                              after_revoked_fault.status ==
+                                  prosper::host::GuestDmemWriteTraceStatus::Stepping &&
+                              after_revoked_fault.invalid_reason ==
+                                  prosper::host::GuestDmemWriteTraceInvalidReason::MappingProtectionChanged &&
+                              after_revoked_fault.event_count == 0,
+                          "revoked sibling fault is rejected without consuming the pending TF owner");
+                    check_kernel_permissions(changed_alias + offset,
+                                             downgraded_prot == PROT_READ, false);
+                    release_invalidation_step.store(true, std::memory_order_release);
+                    pending_writer.join();
+                    invalidation_canary_active.store(false, std::memory_order_release);
+                    const auto completed = prosper::host::guest_dmem_write_trace_snapshot();
+                    CHECK(last_step_action.load(std::memory_order_acquire) == static_cast<int>(
+                              prosper::host::GuestDmemWriteTraceStepAction::CompleteInvalid) &&
+                              protection_marker == 1 && writer_alias[offset] == 0x67 &&
+                              completed.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+                              completed.invalid_reason ==
+                                  prosper::host::GuestDmemWriteTraceInvalidReason::MappingProtectionChanged &&
+                              completed.completed_steps == 1 && completed.event_count == 1 &&
+                              completed.events[0].tid == pending_tid.load(std::memory_order_acquire) &&
+                              !completed.events[0].rearmed && !completed.events[0].post_available &&
+                              completed.rearms == 0,
+                          "downgraded sibling preserves exact TF owner and completes without rearm");
+                    check_kernel_permissions(changed_alias + offset,
+                                             downgraded_prot == PROT_READ, false);
+                }
+                shared_owner.reset();
+                check_kernel_permissions(changed_alias + offset, downgraded_prot == PROT_READ, false);
+                check_kernel_permissions(writer_alias + offset, true, true);
+                check_kernel_permissions(changed_alias, true, true);
+                check_kernel_permissions(changed_alias + 2 * page, true, true);
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(writer_alias), allocation_size);
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(changed_alias), allocation_size);
+                munmap(writer_alias, allocation_size);
+                munmap(changed_alias, allocation_size);
+            }
+        }
+    }
+
+    // An initially RO alias never enters the trace's writable-only page vectors. Its upgrade still
+    // breaks physical-page coverage, so invalidation must consult live mapping topology as well.
+    for (const bool with_production : {false, true}) {
+        std::fprintf(stderr, "[trace-protection-upgrade] production=%d\n", with_production);
+        const int backing = static_cast<int>(syscall(SYS_memfd_create, "trace-upgrade", 0));
+        CHECK(backing >= 0, "create shared trace-upgrade backing");
+        if (backing < 0) continue;
+        const int sized = ftruncate(backing, allocation_size);
+        CHECK(sized == 0, "size shared trace-upgrade backing");
+        if (sized != 0) { close(backing); continue; }
+        auto* writable_alias = static_cast<uint8_t*>(mmap(
+            nullptr, allocation_size, PROT_READ | PROT_WRITE, MAP_SHARED, backing, 0));
+        auto* readonly_alias = static_cast<uint8_t*>(mmap(
+            nullptr, allocation_size, PROT_READ, MAP_SHARED, backing, 0));
+        close(backing);
+        CHECK(writable_alias != MAP_FAILED && readonly_alias != MAP_FAILED,
+              "map pre-existing RW and RO aliases for upgrade control");
+        if (writable_alias == MAP_FAILED || readonly_alias == MAP_FAILED) {
+            if (writable_alias != MAP_FAILED) munmap(writable_alias, allocation_size);
+            if (readonly_alias != MAP_FAILED) munmap(readonly_alias, allocation_size);
+            continue;
+        }
+        std::memset(writable_alias, 0x31, allocation_size);
+        CHECK(readonly_alias[offset] == 0x31, "upgrade aliases share actual backing bytes");
+        CHECK(prosper::host::guest_dmem_write_trace_configure(config),
+              "reset selector for pre-existing RO alias upgrade");
+        constexpr uint64_t upgrade_physical = 0x9c0000;
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(writable_alias), allocation_size, upgrade_physical, 0x3);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(readonly_alias), allocation_size, upgrade_physical, 0x1);
+        prosper::host::guest_dmem_write_trace_notify_allocation(
+            upgrade_physical, allocation_size, chain);
+        CHECK(prosper::host::guest_dmem_write_trace_snapshot().status ==
+                  prosper::host::GuestDmemWriteTraceStatus::Armed,
+              "trace arms with a pre-existing non-writable sibling");
+        prosper::host::GuestWriteWatch shared_owner;
+        if (with_production) {
+            shared_owner = prosper::host::GuestWriteWatch::create(
+                reinterpret_cast<uint64_t>(writable_alias + offset), bytes);
+            CHECK(static_cast<bool>(shared_owner), "production owner shares upgrade-control page");
+        }
+        check_kernel_permissions(readonly_alias + offset, true, false);
+        const int upgraded = mprotect(readonly_alias + page, page, PROT_READ | PROT_WRITE);
+        CHECK(upgraded == 0, "apply actual pre-existing sibling RO-to-RW upgrade");
+        if (upgraded == 0) {
+            prosper::host::guest_write_watch_notify_direct_mapping_protection(
+                reinterpret_cast<uint64_t>(readonly_alias + page), page, 0x3);
+            const auto invalidated = prosper::host::guest_dmem_write_trace_snapshot();
+            CHECK(invalidated.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+                      invalidated.invalid_reason ==
+                          prosper::host::GuestDmemWriteTraceInvalidReason::MappingProtectionChanged,
+                  "physical coverage invalidates even when changed RO alias was absent from trace pages");
+            store_byte(readonly_alias + offset, 0x6a);
+            const auto after_store = prosper::host::guest_dmem_write_trace_snapshot();
+            CHECK(writable_alias[offset] == 0x6a &&
+                      after_store.status == prosper::host::GuestDmemWriteTraceStatus::Invalid &&
+                      after_store.invalid_reason ==
+                          prosper::host::GuestDmemWriteTraceInvalidReason::MappingProtectionChanged &&
+                      after_store.event_count == 0 && after_store.completed_steps == 0 &&
+                      after_store.result != prosper::host::GuestDmemWriteTraceResult::NoSelectedWriteObserved,
+                  "upgraded alias accepts a real store without claiming negative diagnostic coverage");
+        }
+        shared_owner.reset();
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(writable_alias), allocation_size);
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(readonly_alias), allocation_size);
+        munmap(writable_alias, allocation_size);
+        munmap(readonly_alias, allocation_size);
+    }
+
     // ---- host-write rebaseline (#3146) --------------------------------------------------------
     //
     // Three review rounds found three defects in this feature and no test could reach any of them,

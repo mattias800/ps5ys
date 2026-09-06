@@ -5,6 +5,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "gpu/resources/image_identity.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "host/memory/guest_write_watch.hpp"
@@ -5001,6 +5002,390 @@ int main() {
     set_live_target_reader({});
     set_live_target_query({});
 
+    // Exact write-only storage aliases must fold before their independent RTT seed preparation.
+    // The two stores cover different rows through different bindings: losing either store or
+    // splitting the Vulkan image cannot satisfy the byte oracle. Only the canonical owner proves
+    // coverage, so an alias must not repeatedly request a snapshot for its never-published proof.
+    auto check_write_only_rtt_alias = [&](uint32_t height, uint64_t code_addr) {
+        const bool full = height == 2;
+        const bool allow_warm_seed_skip =
+            std::getenv("PROSPER_NO_SKIP_SEED") == nullptr &&
+            std::getenv("PROSPER_VERIFY_SEED_SKIP") == nullptr &&
+            prosper::frontend::seed_reprove_interval_from_env(
+                std::getenv("PROSPER_SEED_REPROVE"), 256u) != 1;
+        static const uint32_t alias_rows[] = {
+            0x7E080300u,              // v4 = x from the local ID
+            0x7E0A0280u,              // v5 = 0: owner writes row zero
+            0x7E0002F2u,              // v0 = 1.0f (red)
+            0x7E020280u,              // v1 = 0
+            0x7E040280u,              // v2 = 0
+            0x7E0602F2u,              // v3 = 1.0f (alpha)
+            0xF0200F08u, 0x00020004u, // IMAGE_STORE through s[8:15], binding 5
+            0x7E0A0281u,              // v5 = 1: alias writes row one
+            0x7E000280u,              // v0 = 0
+            0x7E0202F2u,              // v1 = 1.0f (green)
+            0xF0200F08u, 0x00040004u, // IMAGE_STORE through s[16:23], binding 6
+            0xBF810000u,
+        };
+        std::vector<uint8_t> destination(static_cast<size_t>(W) * height * 4, 0xC7);
+        auto snapshot_bytes = std::make_shared<std::vector<uint8_t>>(destination.size());
+        for (size_t byte = 0; byte < snapshot_bytes->size(); ++byte)
+            (*snapshot_bytes)[byte] = static_cast<uint8_t>(byte * 13 + 29);
+        const uint64_t address = reinterpret_cast<uint64_t>(destination.data());
+        ShaderResourceTable table;
+        for (uint32_t binding = 5; binding <= 6; ++binding) {
+            ShaderResource resource{};
+            resource.cls = ResourceClass::StorageImage;
+            resource.img_dim = 1;
+            resource.binding = binding;
+            resource.sgpr_base = binding == 5 ? 8 : 16;
+            resource.format = DataFormat::Unorm8;
+            resource.num_components = 4;
+            resource.width = W;
+            resource.height = height;
+            resource.depth = 1;
+            resource.gpu_addr = address;
+            resource.size = static_cast<uint32_t>(destination.size());
+            table.resources.push_back(resource);
+        }
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(24);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Unorm8, 4);
+        const std::vector<uint32_t> spirv =
+            recompile_compute(alias_rows, std::size(alias_rows), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const bool write_only_aliases = !spirv.empty() && report.ok() &&
+            report.descriptors.size() == 2 &&
+            std::all_of(report.descriptors.begin(), report.descriptors.end(),
+                [](const SpirvDescriptorBinding& descriptor) {
+                    return descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                           descriptor.writable && !descriptor.readable &&
+                           descriptor.storage_float;
+                });
+        CHECK(write_only_aliases,
+              "RTT alias fixture reflects two native write-only storage bindings");
+        if (!write_only_aliases) return;
+
+        ComputeItem item;
+        item.spirv = spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(table);
+        item.launch.threads_x = item.launch.local_x = W;
+        item.launch.groups_x = 1;
+        item.launch.threads_y = item.launch.threads_z = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = code_addr;
+        uint32_t queries = 0, reads = 0, notifications = 0;
+        bool fail_reader = false;
+        set_live_target_query([&](uint64_t candidate) {
+            if (candidate != address) return false;
+            ++queries;
+            return true;
+        });
+        set_live_target_reader([&](uint64_t candidate, LiveTargetSnapshot& snapshot) {
+            if (candidate != address) return false;
+            ++reads;
+            if (fail_reader) return false;
+            snapshot.width = W;
+            snapshot.height = height;
+            snapshot.format = LiveTargetPixelFormat::Rgba8Unorm;
+            snapshot.pixels = snapshot_bytes;
+            return true;
+        });
+        set_guest_gpu_write_observer([&](uint64_t written_addr, uint64_t bytes, const char*) {
+            if (written_addr == address && bytes == destination.size()) ++notifications;
+        });
+        for (uint32_t run = 0; run < 2; ++run) {
+            const bool unused_reader = full && run != 0 && allow_warm_seed_skip;
+            queries = reads = notifications = 0;
+            // A fresh guest mirror must not satisfy the result oracle without actual writeback.
+            std::fill(destination.begin(), destination.end(), 0xC7);
+            if (run) {
+                for (uint8_t& byte : *snapshot_bytes) byte ^= 0x6D;
+            }
+            fail_reader = unused_reader;
+            std::vector<uint8_t> expected = *snapshot_bytes;
+            for (uint32_t x = 0; x < W; ++x) {
+                const size_t first = static_cast<size_t>(x) * 4;
+                const size_t second = (static_cast<size_t>(W) + x) * 4;
+                expected[first] = 255; expected[first + 1] = expected[first + 2] = 0;
+                expected[first + 3] = 255;
+                expected[second] = expected[second + 2] = 0;
+                expected[second + 1] = expected[second + 3] = 255;
+            }
+            const bool executed = prosper::frontend::execute_live_compute_items({item});
+            CHECK(executed, unused_reader
+                  ? "warm full RTT aliases execute even when an unused snapshot reader would fail"
+                  : "RTT aliases execute with the required canonical snapshot seed");
+            CHECK(destination == expected, full
+                  ? "both write-only aliases contribute their exact distinct output rows"
+                  : "partial write-only aliases preserve the untouched row from the current RTT seed");
+            CHECK(reads == (unused_reader ? 0u : 1u), unused_reader
+                  ? "warm full RTT aliases request no discarded CPU snapshot"
+                  : "RTT alias proving or partial run requests exactly one owner snapshot");
+            CHECK(queries == 2,
+                  "both RTT storage bindings retain their ownership query and pending-write drain");
+            CHECK(notifications == 1,
+                  "exact RTT storage aliases publish one canonical guest-write notification");
+        }
+        if (!full) {
+            const std::vector<uint8_t> before_failure = destination;
+            reads = notifications = 0;
+            fail_reader = true;
+            CHECK(!prosper::frontend::execute_live_compute_items({item}),
+                  "partial RTT alias dispatch still rejects a missing authoritative seed");
+            CHECK(reads == 1 && notifications == 0 && destination == before_failure,
+                  "failed partial RTT alias seed leaves guest bytes and write notifications untouched");
+        }
+        set_guest_gpu_write_observer({});
+        set_live_target_reader({});
+        set_live_target_query({});
+    };
+    check_write_only_rtt_alias(2, 0x590EA10u);
+    check_write_only_rtt_alias(3, 0x590EA11u);
+
+    // #3391: an exact storage view is one image even when its bindings have different access.
+    // Each invocation owns one column, so reads of the untouched row (partial) or reads before
+    // that invocation's own stores (full) have no cross-invocation race. The SSBO independently
+    // observes the input: restoring poisoned pixels at writeback cannot repair a wrong shader read.
+    auto check_mixed_storage_alias = [&](bool reader_first, bool full, bool join_after_proof) {
+        const uint32_t writer_binding = reader_first ? 6u : 5u;
+        const uint32_t reader_binding = reader_first ? 5u : 6u;
+        constexpr uint32_t stored = 0x13579BDFu;
+        std::vector<uint32_t> shader = {
+            0x7E080300u, // v4 = local x, preserved across image loads
+        };
+        auto read_row = [&](uint32_t row, uint32_t buffer_offset) {
+            shader.insert(shader.end(), {
+                row ? 0x7E0A0281u : 0x7E0A0280u, // v5 = row
+                0xF0000108u, 0x00040804u,       // IMAGE_LOAD x -> v8, s[16:23]
+                0xBF8C3F70u,                    // s_waitcnt vmcnt(0)
+                0xE0702000u | buffer_offset, 0x80000804u, // store v8 at v4, s[0:3]
+            });
+        };
+        auto write_row = [&](uint32_t row) {
+            shader.insert(shader.end(), {
+                row ? 0x7E0A0281u : 0x7E0A0280u, // v5 = row
+                0x7E0002FFu, stored,             // v0 = exact integer literal
+                0xF0200108u, 0x00020004u,        // IMAGE_STORE x, s[8:15]
+            });
+        };
+        if (full) {
+            read_row(0, 0);
+            write_row(0);
+            read_row(1, W * sizeof(uint32_t));
+            write_row(1);
+        } else {
+            read_row(1, 0);
+            write_row(0);
+        }
+        shader.push_back(0xBF810000u);
+        std::vector<uint32_t> image_words(W * 2);
+        std::vector<uint32_t> separate_reader(W * 2);
+        std::vector<uint32_t> observed(W * (full ? 2u : 1u), 0xCCCCCCCCu);
+        ShaderResourceTable table;
+        ShaderResource buffer{};
+        buffer.cls = ResourceClass::ConstantBuffer;
+        buffer.binding = 2;
+        buffer.sgpr_base = 0;
+        buffer.format = DataFormat::Uint32;
+        buffer.num_components = 1;
+        buffer.stride = sizeof(uint32_t);
+        buffer.gpu_addr = reinterpret_cast<uint64_t>(observed.data());
+        buffer.size = static_cast<uint32_t>(observed.size() * sizeof(uint32_t));
+        table.resources.push_back(buffer);
+        for (uint32_t binding = 5; binding <= 6; ++binding) {
+            ShaderResource image{};
+            image.cls = ResourceClass::StorageImage;
+            image.binding = binding;
+            image.sgpr_base = binding == writer_binding ? 8 : 16;
+            image.img_dim = 1;
+            image.format = DataFormat::Uint32;
+            image.num_components = 1;
+            image.width = W;
+            image.height = 2;
+            image.depth = 1;
+            image.gpu_addr = reinterpret_cast<uint64_t>(image_words.data());
+            image.size = static_cast<uint32_t>(image_words.size() * sizeof(uint32_t));
+            table.resources.push_back(image);
+        }
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(24);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Uint32, 1);
+        const std::vector<uint32_t> spirv =
+            recompile_compute(shader.data(), shader.size(), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const auto* writer = find_spirv_descriptor_binding(report, 0, writer_binding);
+        const auto* reader = find_spirv_descriptor_binding(report, 0, reader_binding);
+        const auto* output = find_spirv_descriptor_binding(report, 0, buffer.binding);
+        const auto exact_r32 = [](const SpirvDescriptorBinding* descriptor) {
+            return descriptor && descriptor->kind == SpirvDescriptorKind::StorageImage &&
+                   descriptor->image_numeric_class == SpirvImageNumericClass::Uint &&
+                   descriptor->storage_image_format == kSpirvImageFormatR32ui &&
+                   descriptor->image_dim == 1 && !descriptor->image_arrayed &&
+                   !descriptor->image_multisampled;
+        };
+        const bool access_ok = !spirv.empty() && report.ok() && report.descriptors.size() == 3 &&
+            exact_r32(writer) && writer->writable && !writer->readable &&
+            exact_r32(reader) && reader->readable && !reader->writable &&
+            output && output->kind == SpirvDescriptorKind::StorageBuffer && output->writable;
+        CHECK(access_ok, "mixed storage fixture reflects distinct write-only/read-only R32_UINT bindings and SSBO");
+        if (!access_ok) return;
+        const ComputeImageViewShape shape{true, 1, 1};
+        CHECK(shader_resource_same_view(table.resources[1], table.resources[2], shape, shape, true),
+              "mixed storage fixture begins with exact storage-view identity");
+        ComputeItem item;
+        item.spirv = spirv;
+        item.launch.threads_x = item.launch.local_x = W;
+        item.launch.threads_y = item.launch.threads_z = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x33910000u + (reader_first ? 0x100u : 0u) +
+                         (full ? 0x10u : 0u) + (join_after_proof ? 1u : 0u);
+        for (uint32_t run = 0; run < 4; ++run) {
+            const bool aliased = !join_after_proof || run >= 2;
+            for (uint32_t texel = 0; texel < W * 2; ++texel) {
+                image_words[texel] = 0x24680000u + run * 0x1000u + texel * 17u;
+                separate_reader[texel] = 0xABCD0000u + run * 0x1000u + texel * 19u;
+            }
+            std::fill(observed.begin(), observed.end(), 0xCCCCCCCCu);
+            for (ShaderResource& resource : table.resources) {
+                if (resource.binding == reader_binding)
+                    resource.gpu_addr = reinterpret_cast<uint64_t>(
+                        aliased ? image_words.data() : separate_reader.data());
+            }
+            CHECK(shader_resource_same_view(table.resources[1], table.resources[2], shape, shape, true) == aliased,
+                  "mixed storage dispatch pins exact alias identity or deliberate separate-view control");
+            const std::vector<uint32_t>& input = aliased ? image_words : separate_reader;
+            const std::vector<uint32_t> expected_observed(
+                input.begin() + (full ? 0u : W), input.end());
+            std::vector<uint32_t> expected_image = image_words;
+            std::fill_n(expected_image.begin(), full ? W * 2 : W, stored);
+            item.resources = std::make_shared<ShaderResourceTable>(table);
+            const bool executed = prosper::frontend::execute_live_compute_items({item});
+            if (!executed || image_words != expected_image || observed != expected_observed)
+                std::printf("  mixed storage alias reader_first=%u full=%u join_after_proof=%u run=%u aliased=%u\n",
+                            reader_first, full, join_after_proof, run, aliased);
+            CHECK(executed, "mixed storage alias dispatch executes in both binding orders");
+            CHECK(image_words == expected_image,
+                  "mixed storage alias writes exact output and preserves every untouched image texel");
+            CHECK(observed == expected_observed,
+                  "mixed storage alias reader observes current exact input, including warm and newly joined views");
+        }
+    };
+    for (bool reader_first : {false, true}) {
+        check_mixed_storage_alias(reader_first, false, false);
+        check_mixed_storage_alias(reader_first, true, false);
+        check_mixed_storage_alias(reader_first, true, true);
+    }
+
+    // A Full proof established jointly by two write-only aliases is not a proof for either
+    // binding alone. Keep code and extents fixed while the group splits, then joins again.
+    // Conversely, an isolated owner's None proof cannot suppress a newly joined writer.
+    auto check_write_only_group_membership = [&](bool none_owner) {
+        std::vector<uint32_t> split_writer_code = {
+            0x7E080300u,                         // v4 = x
+            0x7E0A0280u,                         // row zero through binding 5
+            0x7E0002FFu, 0x13579BDFu,
+            0xF0200108u, 0x00020004u,
+            0x7E0A0281u,                         // row one through binding 6
+            0x7E0002FFu, 0x2468ACE0u,
+            0xF0200108u, 0x00040004u,
+            0xBF810000u,
+        };
+        if (none_owner) {
+            // Keep the store reflected, but put the owner's row outside the image. Binding 6
+            // still writes row one, so separate -> joined changes owner coverage None -> Partial.
+            split_writer_code[1] = 0x7E0A02FFu;
+            split_writer_code.insert(split_writer_code.begin() + 2, 9999u);
+        }
+        std::vector<uint32_t> first(W * 2), second(W * 2);
+        ShaderResourceTable table;
+        for (uint32_t binding = 5; binding <= 6; ++binding) {
+            ShaderResource image{};
+            image.cls = ResourceClass::StorageImage;
+            image.binding = binding;
+            image.sgpr_base = binding == 5 ? 8 : 16;
+            image.img_dim = 1;
+            image.format = DataFormat::Uint32;
+            image.num_components = 1;
+            image.width = W;
+            image.height = 2;
+            image.depth = 1;
+            image.gpu_addr = reinterpret_cast<uint64_t>(first.data());
+            image.size = static_cast<uint32_t>(first.size() * sizeof(uint32_t));
+            table.resources.push_back(image);
+        }
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(24);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Uint32, 1);
+        const std::vector<uint32_t> spirv = recompile_compute(
+            split_writer_code.data(), split_writer_code.size(), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const bool shape_ok = !spirv.empty() && report.ok() && report.descriptors.size() == 2 &&
+            std::all_of(report.descriptors.begin(), report.descriptors.end(),
+                [](const SpirvDescriptorBinding& descriptor) {
+                    return descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                           descriptor.writable && !descriptor.readable &&
+                           descriptor.image_numeric_class == SpirvImageNumericClass::Uint &&
+                           descriptor.storage_image_format == kSpirvImageFormatR32ui &&
+                           descriptor.image_dim == 1 && !descriptor.image_arrayed &&
+                           !descriptor.image_multisampled;
+                });
+        CHECK(shape_ok, "alias split/rejoin fixture reflects two exact write-only R32_UINT images");
+        if (shape_ok) {
+            ComputeItem item;
+            item.spirv = spirv;
+            item.code_addr = none_owner ? 0x3391A11Bu : 0x3391A11Au;
+            item.launch.threads_x = item.launch.local_x = W;
+            item.launch.threads_y = item.launch.threads_z = 1;
+            item.launch.local_y = item.launch.local_z = 1;
+            item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+            const ComputeImageViewShape shape{true, 1, 1};
+            for (uint32_t run = 0; run < 6; ++run) {
+                const bool aliased = none_owner ? run >= 2 && run < 4 : run < 2 || run >= 4;
+                for (uint32_t texel = 0; texel < W * 2; ++texel) {
+                    first[texel] = 0xAAAA0000u + run * 0x1000u + texel * 23u;
+                    second[texel] = 0xBBBB0000u + run * 0x1000u + texel * 29u;
+                }
+                table.resources[1].gpu_addr = reinterpret_cast<uint64_t>(
+                    aliased ? first.data() : second.data());
+                CHECK(shader_resource_same_view(table.resources[0], table.resources[1], shape, shape, true) == aliased,
+                      "write-only group membership follows the explicit alias/split/rejoin sequence");
+                std::vector<uint32_t> expected_first = first, expected_second = second;
+                if (!none_owner) std::fill_n(expected_first.begin(), W, 0x13579BDFu);
+                std::fill_n((aliased ? expected_first : expected_second).begin() + W, W, 0x2468ACE0u);
+                item.resources = std::make_shared<ShaderResourceTable>(table);
+                const bool executed = prosper::frontend::execute_live_compute_items({item});
+                if (!executed || first != expected_first || second != expected_second)
+                    std::printf("  write-only alias split/rejoin none_owner=%u run=%u aliased=%u\n",
+                                none_owner, run, aliased);
+                CHECK(executed, "write-only storage group executes through alias/split/rejoin transitions");
+                CHECK(first == expected_first && second == expected_second,
+                      none_owner
+                          ? "write-only group None proof never suppresses a newly joined writer"
+                          : "write-only group Full proof never discards fresh untouched rows after a split");
+            }
+        }
+    };
+    check_write_only_group_membership(false);
+    check_write_only_group_membership(true);
+
     // The exact packed fallback must obey the same authority rule. Keep stale zeroes in guest RAM,
     // publish distinct R11G11B10 renderer pixels, overwrite only row zero, and require every other
     // row to survive from the snapshot rather than the stale allocation.
@@ -6056,9 +6441,30 @@ int main() {
                 alternating_changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
                 const uint64_t dynamic_snapshots_before =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                ShaderResource dynamic_sampled = fdst;
+                dynamic_sampled.cls = ResourceClass::Texture;
+                prosper::frontend::LiveComputeImageImport dynamic_import;
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "warm changing target has cross-submit watch-backed export authority");
+                dynamic_import = {};
+                const auto dynamic_watch_before = prosper::host::guest_write_watch_stats();
                 CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
                           prosper::frontend::execute_live_compute_items({it}),
                       "alternating full-coverage storage results execute");
+                const auto dynamic_watch_after = prosper::host::guest_write_watch_stats();
+                CHECK(dynamic_watch_after.create_attempts == dynamic_watch_before.create_attempts,
+                      "warm changing full writers reuse their export watch registration");
+                CHECK(dynamic_watch_after.rearms >= dynamic_watch_before.rearms + 2,
+                      "each changing writer rearms its retained export watch at publication");
+                CHECK(fill_equals(after_prove),
+                      "watch retention preserves exact alternating storage results");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "retained watch authorizes the completed result across submits");
+                dynamic_import = {};
                 const uint64_t dynamic_snapshots_after =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
                 if (adaptive_storage_result_validation_enabled) {
@@ -6069,6 +6475,39 @@ int main() {
                               dynamic_snapshots_before + 2 * fill_guest_bytes,
                           "disabled adaptive policy preserves exact dynamic snapshots");
                 }
+                // The installed alternate-stack handler must dirty the retained registration on
+                // a real guest store, without a submit-local journal or an explicit GPU notification.
+                fill_guest[0] ^= 0xff;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import),
+                      "CPU write revokes a reused cross-submit export watch");
+                CHECK(prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "ordinary writeback repairs a guest store after watch reuse");
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes);
+                CHECK(mmap(fill_guest, fill_mapping_bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == fill_guest,
+                      "replace warm storage target backing at the same virtual address");
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes,
+                    0x33860000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
+                CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
+                          prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "full writers rebuild authority after guest target remapping");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "replacement mapping obtains fresh cross-submit export authority");
+                dynamic_import = {};
+                fill_guest[0] ^= 0xff;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import),
+                      "CPU store to remapped target revokes the recreated export watch");
+                CHECK(prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "ordinary writeback repairs the remapped target after its CPU store");
             }
 #endif
 

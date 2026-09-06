@@ -30,6 +30,91 @@ an overall **~34x speedup** (measured across 106 rendered frames in 4.90 s; Run 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## Linux windowed baseline (2026-09-06, #3065)
+
+At `a5150495e`, a fresh Release build with `-O3 -DNDEBUG -g1 -fno-omit-frame-pointer`
+reached the bank gameplay scene on the unchanged `reach-performance-story.pad` route. Both save
+roots were fresh. Frontend screenshots confirmed **Graphics Mode: Performance** and subsequently
+the bank interior, characters, radar and walking tutorial. The nine-minute run used native rendering,
+full cadence, immediate presentation, default cache/worker settings and no diagnostic compute skips;
+the app confirmed the renderer's shared present queue. No device-loss signal was recorded.
+
+The native Linux/RADV F8 window measured **5.58 guest flips/s and 5.78 host presents/s** over
+5.02 seconds, with 1.51 process CPU cores. Its 720 renderer and 1,917 compute detail records were
+not truncated. Measured totals were 2,311 ms graphics and 1,547 ms compute; resource preparation
+accounted for 1,179 ms across its frontend/backend layers. These are scoped timing records, not an
+exhaustive GPU frame budget. The later F9 bundle completed with 73 submits and a matching frontend
+gameplay image, outside the timed window. Artifact hashes and capture details belong to #3065.
+
+A separate 20-second CPU profile retained 1,607 samples with zero reported loss. Compiled-key hashing
+was 5.91% of **sampled** CPU; this is not a share of frame time or a promised speedup. Inspection found
+that `make_shader_compile_key` computed a provisional hash which all three callers unconditionally
+overwrote after attaching diagnostic settings. Removing that first calculation preserves the final key,
+equality checks and shader output. End-to-end performance improvement is not yet established.
+
+### Duplicate storage-image preparation (#3065)
+
+On merged `805b49d53`, a later native Performance Story F8 isolated **3.512 ms** in the first
+duplicate storage binding's pre-alias-processing interval, against **3.836 ms** total setup for
+program hash `1d3f91e7f9a30140` (28 fully warm dispatches). Its 3840×2160 RGBA8 output binds one
+canonical storage image and three exact aliases. The interval is not the cost of copying alias
+fields: the backend requests an RTT snapshot before discovering the alias, while only the owner
+publishes a binding-specific coverage proof. The renderer can materialize a full target on that read.
+
+Exact write-only storage aliases now fold before this redundant snapshot/coverage preparation,
+after descriptor, device, shape and DCC validation and the ownership query's pending-write drain.
+Reflected storage representation and complete resource-view identity must match. Canonical seeding,
+partial-write preservation and one writeback remain; sampled and mixed-access bindings retain the
+late path. Synthetic execution checks both aliases' distinct pixels, necessary partial seeds and
+missing-seed rejection; disabling only the early fold fails seven assertions. This establishes the
+mechanism, not an end-to-end speedup. Native comparison evidence remains in #3065.
+
+The phase-report tool's alias records are **not zero work**: this capture has 101.930 ms in aliases
+versus 26.963 ms in real-image records. The report's misleading alias-only wording is tracked in
+#3388. Do not treat its real-image-only decomposition as all image setup.
+
+### Streaming per-draw shader properties (#3065)
+
+A fresh native Performance Story baseline on `7dfcc038` (source tree equal to main `5974d41b5`)
+again rendered the bank at “Go to the guard,” without a device-loss signal. Its complete F8 window
+contained 779 renderer and 2,120 compute records with zero drops and measured 5.98 guest/host
+flips per second over 5.016 seconds. This is an instrumented attribution window, not a new
+progression milestone or an untouched throughput comparison.
+
+The separate userspace CPU profile identified repeated instruction-vector construction in
+`fragment_color_export_mask` and `rdna2_vertex_prolog_info`. These queries now decode directly
+without retaining a full vector: first nonzero export per MRT is unchanged, and prolog branches
+must still target the retained prefix or its exact transfer instruction. Shader translation,
+resource resolution, cache validation and emitted instructions are unchanged. The existing
+dynamic-fetch decode cache is not absent and is not modified by this change.
+
+CPU-only comparison against the previous vector algorithms covered 139 fragment and 88 vertex
+streams extracted from the native F9 frame, with identical property results throughout. Across
+six alternating trials, summing each unique stream's median one-call time gave 1.368 → 0.224 ms
+for fragment masks and 0.215 → 0.00681 ms for vertex-prolog queries. These unweighted corpus totals
+are **not per-frame costs or FPS gains**. All retained vertex streams reject as split prologs;
+accepted transfers, signed branch boundaries, truncated inputs and same-address mutations are
+covered separately by the CPU regression. Its allocation controls fail with the old vector
+implementations while the property-equivalence checks remain green. Native comparison and exact
+verification evidence are tracked in #3065.
+
+### Constant-time texture binding statistics (#3065)
+
+The next retained native profile (production source equivalent to main `f9188bd39`) contains
+31,373 userspace samples and 52,814,729,223 summed sample periods. Three instruction addresses
+in the exact binary's end-of-pass texture-binding census account for 1,156,672,656 periods:
+**2.19006% of sampled user cycles**, not frame time or a projected FPS gain. That loop walks
+every persistent texture image solely to sum its binding-map size; it is not texture validation
+or upload. Exact-ELF callchains and disassembly distinguish this bookkeeping from those costs.
+
+The backend now maintains the same aggregate under its existing persistent-resource lock:
+successful binding insertion adds one, binding eviction removes one, and image retirement
+subtracts that image's bindings. Invalid content remains counted until actually retired.
+Rendering, upload/validation policy, cache limits and the statistics publication point are
+unchanged. Focused tests cover multiple images, invalid-but-resident content, both eviction
+paths and view/sampler failures before and after eviction. Native comparison evidence and
+the still-open broader resource-preparation budget remain in #3065.
+
 ## Gameplay framerate optimization: reaching 21+ FPS (2026-09-03)
 
 **Platform**: Measured on **Windows 11 / Intel Core i9 (24 physical cores) / discrete NVIDIA GeForce RTX 4090 (24 GB VRAM, Vulkan 1.4)**.

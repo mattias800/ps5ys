@@ -23,6 +23,10 @@ static int fails = 0;
 
 int main() {
     printf("== test_texture_sample_render ==\n");
+    if (std::getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB")) {
+        std::fprintf(stderr, "texture sample test requires PROSPER_BACKEND_TEXTURE_CACHE_MB absent\n");
+        return 2;
+    }
     const uint32_t W = 64, H = 64;
     const auto center_red_at = [](const std::vector<uint8_t>& pixels,
                                   uint32_t width, uint32_t height) -> uint8_t {
@@ -340,6 +344,8 @@ int main() {
 
         std::vector<uint8_t> first = prosper::test::render_draws_rgba({draw}, W, H);
         const auto first_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 0,
+              "publishing a new image does not count its transient first-use binding");
         std::vector<uint8_t> reused = prosper::test::render_draws_rgba({draw}, W, H);
         const auto reused_stats = prosper::test::backend_texture_upload_stats();
         const auto first_binding_stats = prosper::test::backend_resource_reuse_stats();
@@ -351,7 +357,8 @@ int main() {
                    reused_stats.upload_bytes == 0,
               "same exact-validated texture version skips its next callback upload");
         CHECK(first_binding_stats.persistent_texture_binding_misses == 1 &&
-                  first_binding_stats.persistent_texture_binding_hits == 0,
+                  first_binding_stats.persistent_texture_binding_hits == 0 &&
+                  first_binding_stats.persistent_texture_binding_entries == 1,
               "first persistent-image reuse retains its exact image-view/sampler binding");
         CHECK(reused_binding_stats.persistent_texture_binding_hits == 1 &&
                   reused_binding_stats.persistent_texture_binding_misses == 0 &&
@@ -370,6 +377,9 @@ int main() {
             std::vector<uint8_t> bounded = prosper::test::render_draws_rgba({draw}, W, H);
             CHECK(!bounded.empty(), "bounded persistent texture binding renders");
             bounded_binding_stats = prosper::test::backend_resource_reuse_stats();
+            CHECK(bounded_binding_stats.persistent_texture_binding_entries ==
+                      (i < 32 ? i + 1 : 32),
+                  "every new binding increments the exact census, eviction keeps it bounded");
         }
         CHECK(bounded_binding_stats.persistent_texture_binding_evictions == 1 &&
                   bounded_binding_stats.persistent_texture_binding_entries == 32,
@@ -426,6 +436,98 @@ int main() {
               "a new exact-validated content version cannot hit the prior image");
         CHECK(!changed.empty() && changed != reused,
               "a new content version uploads and renders its changed pixels");
+
+        CHECK(prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 32,
+              "publishing a second image preserves all bindings of the first image");
+        const std::vector<uint8_t> second_image_reused =
+            prosper::test::render_draws_rgba({draw}, W, H);
+        const auto second_image_bindings = prosper::test::backend_resource_reuse_stats();
+        const std::vector<uint8_t> second_image_hit =
+            prosper::test::render_draws_rgba({draw}, W, H);
+        CHECK(second_image_reused == changed && second_image_hit == changed &&
+                  second_image_bindings.persistent_texture_binding_entries == 33 &&
+                  second_image_bindings.persistent_texture_binding_misses == 1 &&
+                  prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 33 &&
+                  prosper::test::backend_resource_reuse_stats().persistent_texture_binding_hits == 1,
+              "aggregate counts 32 bindings plus a second image's binding, unchanged on a hit");
+        const auto second_image_draw = draw;
+
+        // Retire an INVALID image which already owns 32 bindings, not just the zero-binding cold
+        // upload above. A discarded version refresh invalidates it; the retry must subtract all
+        // those bindings while preserving the second image's one binding.
+        resource.persistent_texture_id = 0x7020000000000001ull;
+        resource.persistent_texture_version = 2;
+        resource.tex_rgba = texels;
+        draw.R = {resource};
+        constexpr uint64_t refresh_target_id = 0x75900000000000f2ull;
+        prosper::test::BackendColorTarget refresh_target{refresh_target_id, false, false};
+        prosper::test::BackendSubmissionBatch refresh_batch;
+        const std::vector<uint8_t> refresh_pending = prosper::test::render_draws_rgba(
+            {draw}, W, H, nullptr, nullptr, false, &refresh_target,
+            nullptr, nullptr, nullptr, &refresh_batch, false);
+        const auto pending_binding_stats = prosper::test::backend_resource_reuse_stats();
+        refresh_batch.discard();
+        refresh_batch.complete();
+        const std::vector<uint8_t> while_first_invalid =
+            prosper::test::render_draws_rgba({second_image_draw}, W, H);
+        const auto resident_invalid_bindings = prosper::test::backend_resource_reuse_stats();
+        CHECK(while_first_invalid == changed &&
+                  resident_invalid_bindings.persistent_texture_binding_entries == 33 &&
+                  resident_invalid_bindings.persistent_texture_binding_hits == 1 &&
+                  prosper::test::backend_texture_upload_stats().unique_uploads == 0,
+              "invalid but resident image keeps its 32 bindings counted until actual retirement");
+        const std::vector<uint8_t> refresh_retry = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto retry_bindings = prosper::test::backend_resource_reuse_stats();
+        const auto retry_uploads = prosper::test::backend_texture_upload_stats();
+        CHECK(refresh_pending.empty() && !refresh_batch.pending() &&
+                  pending_binding_stats.persistent_texture_binding_entries == 33 &&
+                  retry_bindings.persistent_texture_binding_entries == 1 &&
+                  retry_uploads.persistent_misses == 1 && retry_uploads.unique_uploads == 1 &&
+                  refresh_retry == reused,
+              "invalid-image replacement subtracts all 32 owned bindings, retains other image, restores pixels");
+        const std::vector<uint8_t> refresh_retry_hit = prosper::test::render_draws_rgba({draw}, W, H);
+        CHECK(refresh_retry_hit == refresh_retry &&
+                  prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 2,
+              "rebuilt image contributes exactly one new persistent binding on its next use");
+        prosper::test::invalidate_persistent_color_target(refresh_target_id);
+
+        // The existing device-budget seam avoids driver-specific allocation sizes or 1025 calls.
+        // One byte admits no RGBA texture. An unrelated current image leaves both old images idle,
+        // so end-of-pass LRU eviction must remove their bindings and restore the census to zero.
+        const VkDeviceSize saved_budget = prosper::test::persistent_texture_cache_device_budget();
+        {
+            struct ScopedTextureBudget {
+                VkDeviceSize saved;
+                ScopedTextureBudget() {
+                    prosper::test::BackendPersistentResourceGuard guard;
+                    saved = prosper::test::persistent_texture_cache_device_budget();
+                    prosper::test::persistent_texture_cache_device_budget() = 1;
+                }
+                ~ScopedTextureBudget() {
+                    prosper::test::BackendPersistentResourceGuard guard;
+                    prosper::test::persistent_texture_cache_device_budget() = saved;
+                }
+            } budget_guard;
+            CHECK(prosper::test::persistent_texture_cache_limit() == 1,
+                  "one-byte device-budget lever is effective, not shadowed by an environment override");
+            auto eviction_draw = draw;
+            eviction_draw.R[0].persistent_texture_id = 0x70200000000000f3ull;
+            const std::vector<uint8_t> evicting_pixels =
+                prosper::test::render_draws_rgba({eviction_draw}, W, H);
+            CHECK(evicting_pixels == reused &&
+                      prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 0 &&
+                      prosper::test::backend_texture_upload_stats().persistent_cached_bytes == 0,
+                  "whole-image LRU eviction removes every retained binding without changing rendered pixels");
+        }
+        CHECK(prosper::test::persistent_texture_cache_device_budget() == saved_budget,
+              "scoped eviction pressure restores the previous device budget");
+        const std::vector<uint8_t> after_eviction = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto after_eviction_uploads = prosper::test::backend_texture_upload_stats();
+        const std::vector<uint8_t> after_eviction_hit = prosper::test::render_draws_rgba({draw}, W, H);
+        CHECK(after_eviction == reused && after_eviction_hit == reused &&
+                  after_eviction_uploads.persistent_misses == 1 &&
+                  prosper::test::backend_resource_reuse_stats().persistent_texture_binding_entries == 1,
+              "post-eviction image and binding are rebuilt from zero with exact output");
     }
 
     // A guest color target can remain on the backend GPU between render calls and be sampled by

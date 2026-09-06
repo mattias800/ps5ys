@@ -153,6 +153,11 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME profiling_access
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/profiling_access/test_access.py")
+    set_tests_properties(profiling_access PROPERTIES TIMEOUT 30)
+  endif()
   # The human-authored snapshot store. Runs with no dump and no emulator: every arm builds its own
   # BMPs. The arms are chosen around SILENT failure -- a signature that cannot separate two scenes
   # would pass every regression, and an accept() that moved the signature without the reference
@@ -1336,6 +1341,13 @@ if(TARGET prosper_core)
   target_include_directories(test_compute_image_borrow_census PRIVATE frontends)
   add_test(NAME compute_image_borrow_census COMMAND test_compute_image_borrow_census)
 
+  # Storage-image alias access union is metadata-only and must run without Vulkan on every platform.
+  add_executable(test_storage_image_alias_plan
+                 frontends/shared/tests/test_storage_image_alias_plan.cpp)
+  target_include_directories(test_storage_image_alias_plan PRIVATE frontends src)
+  target_link_libraries(test_storage_image_alias_plan PRIVATE prosper_core)
+  add_test(NAME storage_image_alias_plan COMMAND test_storage_image_alias_plan)
+
   add_executable(test_texture_decode_diagnostic
                  frontends/shared/tests/test_texture_decode_diagnostic.cpp)
   target_include_directories(test_texture_decode_diagnostic PRIVATE frontends src)
@@ -1920,6 +1932,12 @@ if(TARGET prosper_core)
                  tests/gpu/recompiler/test_vertex_fetch_reject_diagnostic.cpp)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
+
+  # CPU-only streaming shader properties: exact legacy semantics without per-query vectors.
+  add_executable(test_shader_property_scans tests/gpu/recompiler/test_shader_property_scans.cpp)
+  target_link_libraries(test_shader_property_scans PRIVATE prosper_core)
+  add_test(NAME shader_property_scans COMMAND ${CMAKE_COMMAND} -E env
+           --unset=PROSPER_PROLOGLOG $<TARGET_FILE:test_shader_property_scans>)
 
   add_executable(test_gta5_selected_sbuffer tests/gpu/recompiler/test_gta5_selected_sbuffer.cpp)
   target_link_libraries(test_gta5_selected_sbuffer PRIVATE prosper_core)
@@ -3020,7 +3038,8 @@ if(TARGET prosper_core)
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
       target_include_directories(test_texture_sample_render PRIVATE frontends)
       target_link_libraries(test_texture_sample_render PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME texture_sample_render COMMAND test_texture_sample_render)
+      add_test(NAME texture_sample_render COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB $<TARGET_FILE:test_texture_sample_render>)
 
       # Multi-draw backend: N draws composited into ONE cleared-once framebuffer (red opaque + green
       # additive -> yellow center proves accumulation into a single target).

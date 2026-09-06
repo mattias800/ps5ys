@@ -4,6 +4,7 @@
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
+#include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/live_target_format.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -2781,7 +2782,8 @@ struct VulkanComputeContext {
                                       const uint8_t* current_source = nullptr,
                                       bool result_unchanged = false,
                                       bool source_snapshot_required = true,
-                                      bool compute_transfer_watch = false) {
+                                      bool compute_transfer_watch = false,
+                                      bool retain_export_watch = false) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
@@ -2833,9 +2835,14 @@ struct VulkanComputeContext {
             if (!cached.write_watch)
                 cached.write_watch = prosper::host::GuestWriteWatch::create(
                     key.gpu_addr, key.guest_bytes);
-        } else {
+        } else if (!retain_export_watch) {
             cached.write_watch.reset();
         }
+        // Export authority is revoked before dispatch, independently of the watch's lifetime.
+        // A successful exportable full writer can retain its registration until publication rearms
+        // it against the completed guest writeback. Resetting it here only makes publication rebuild
+        // the same page registration. Do not rearm early or restore export authority here; failure
+        // cleanup still invalidates the content and discards the watch.
         if (!source_was_valid) {
             // A failed dispatch/readback may have advanced the retained GPU result while leaving
             // guest memory at the old baseline. The successful repair must replace that invalidated
@@ -5545,8 +5552,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         uint64_t written_layers = ~0ULL;
         bool near_full = false;
     };
-    // key = (shader code_addr, output binding, width, height, depth) -- collision-free by construction.
-    using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
+    // Coverage was observed over the shared image, so its writer membership is part of the proof.
+    // Splitting a previously full-coverage alias group can leave the owner only partially written.
+    using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                       std::vector<uint32_t>>;
     static std::mutex seed_coverage_mu;
     static std::map<SeedCoverageKey, SeedVerdict> seed_coverage_proof;
     // PROSPER_SEED_REPROVE=N: re-prove every N fast-skips (default 256; explicit 0 disables = old
@@ -5772,6 +5781,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     std::sort(image_descriptors.begin(), image_descriptors.end(), [](const auto& a, const auto& b) {
         return a.binding < b.binding;
     });
+    const auto image_alias_plan = item.resources
+        ? prosper::frontend::plan_storage_image_aliases(image_descriptors, *item.resources)
+        : prosper::frontend::StorageImageAliasPlan{};
+    if (!image_alias_plan.valid) return decline("storage-alias-resource-missing");
+    const auto image_seed_coverage_key = [&](size_t i, const ShaderResource& resource) {
+        return SeedCoverageKey{
+            item.code_addr, image_descriptors[i].binding,
+            resource.width, resource.height, resource.depth,
+            image_alias_plan.groups[image_alias_plan.group_for_image[i]].bindings};
+    };
 
     const LiveComputeBufferDescriptorPlan buffer_plan =
         plan_live_compute_buffer_descriptors(
@@ -6328,6 +6347,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             image_timing_requested && timing_item_selected &&
             (!timing_capture_only || perf_capture_timing) &&
             (!timing_trace_only || trace);
+        const auto bind_image_alias = [&](size_t i, size_t j, ComputeClock::time_point start) {
+            BoundImage& bi = images[i];
+            bi.alias_of = images[j].alias_of == SIZE_MAX ? j : images[j].alias_of;
+            const BoundImage& owner = images[bi.alias_of];
+            bi.image = owner.image; bi.memory = owner.memory; bi.view = owner.view;
+            bi.sampler = owner.sampler; bi.guest_bytes = owner.guest_bytes;
+            bi.texel_depth = owner.texel_depth;
+            bi.array_layers = owner.array_layers;
+            bi.mip_levels = owner.mip_levels;
+            bi.mip_staging_offsets = owner.mip_staging_offsets;
+            bi.dcc_metadata = owner.dcc_metadata;
+            bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
+            staging_bytes[i] = staging_bytes[bi.alias_of];
+            const ShaderResource& r = *bi.resource;
+            if (trace)
+                std::fprintf(stderr, "[compute]   image-alias binding=%u -> binding=%u addr=0x%llx\n",
+                             bi.binding, owner.binding, (unsigned long long)r.gpu_addr);
+            if (image_timing)
+                std::fprintf(stderr,
+                             "[compute-image] code=0x%llx hash=0x%016llx "
+                             "binding=%u class=%s alias=1 addr=0x%llx alias_of=%u "
+                             "persistent=%u upload-skipped=%u "
+                             "extent=%ux%ux%u ms=%.3f\n",
+                             (unsigned long long)item.code_addr,
+                             (unsigned long long)timing_program_hash, bi.binding,
+                             bi.storage ? "storage" : "sampled",
+                             (unsigned long long)r.gpu_addr, owner.binding,
+                             owner.persistent ? 1u : 0u,
+                             owner.upload_skipped ? 1u : 0u,
+                             r.width, r.height, r.depth,
+                             std::chrono::duration<double, std::milli>(
+                                 ComputeClock::now() - start).count());
+        };
         for (size_t i = 0; i < image_descriptors.size() && images_ready; i++) {
             // Every skip_image call below is inside this loop, so the cursor is always the binding
             // being decided.
@@ -6494,8 +6546,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (dim_cube_stacked && (r->depth < 6 || r->height > UINT32_MAX / 6u)) {
                 skip_image(r, "cube image does not contain six valid faces"); break;
             }
-            bi.texel_depth = dim_3d ? r->depth : 1u;
-            bi.array_layers = dim_2d_array ? r->depth : 1u;
+            const auto alias_shape = prosper::frontend::compute_image_alias_shape(
+                *r, image_descriptors[i]);
+            bi.texel_depth = alias_shape.texel_depth;
+            bi.array_layers = alias_shape.array_layers;
             if (cube_face_as_2d && trace)
                 std::fprintf(stderr,
                              "[compute]   binding cube face zero as shader-declared 2D image "
@@ -6535,6 +6589,45 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bool renderer_owned = !r->in_mip_tail && is_live_render_target(r->gpu_addr);
             query_ms = std::chrono::duration<double, std::milli>(
                 ComputeClock::now() - query_start).count();
+            // Exact write-only storage aliases already have a fully prepared canonical image.
+            // Fold before requesting an RTT snapshot or consulting this binding's coverage proof:
+            // only the owner writes back and publishes a proof, so the duplicate would otherwise
+            // keep requesting a snapshot even after the owner has proved a full overwrite.
+            // Keep the ownership query above: the live renderer also drains pending guest writes.
+            // Sampled/imported representations and mixed-access bindings retain the late path.
+            const auto& decl = image_descriptors[i];
+            if (bi.storage && decl.writable && !decl.readable && !decl.atomic_access) {
+                for (size_t j = 0; j < i; ++j) {
+                    const BoundImage& owner = images[j];
+                    const auto& owner_decl = image_descriptors[j];
+                    if (!owner.storage || owner.alias_of != SIZE_MAX || !owner.resource ||
+                        !owner_decl.writable || owner_decl.readable || owner_decl.atomic_access)
+                        continue;
+                    const bool same_representation =
+                        decl.image_numeric_class == owner_decl.image_numeric_class &&
+                        decl.storage_image_format == owner_decl.storage_image_format &&
+                        decl.image_dim == owner_decl.image_dim &&
+                        decl.image_arrayed == owner_decl.image_arrayed &&
+                        decl.image_multisampled == owner_decl.image_multisampled &&
+                        decl.image_depth == owner_decl.image_depth &&
+                        bi.native_float_storage == owner.native_float_storage &&
+                        bi.native_uint_storage == owner.native_uint_storage &&
+                        bi.packed_r11_storage == owner.packed_r11_storage &&
+                        bi.graphics_sampled_usage == owner.graphics_sampled_usage &&
+                        !owner.imported && !owner.depth_bits_source &&
+                        !owner.unorm_rtt_value_reuse;
+                    const prosper::gpu::ComputeImageViewShape owner_shape{
+                        owner.storage, owner.texel_depth, owner.array_layers};
+                    const prosper::gpu::ComputeImageViewShape this_shape{
+                        bi.storage, bi.texel_depth, bi.array_layers};
+                    if (!prosper::gpu::shader_resource_same_view(
+                            *owner.resource, *r, owner_shape, this_shape, same_representation))
+                        continue;
+                    bind_image_alias(i, j, image_start);
+                    break;
+                }
+                if (bi.alias_of != SIZE_MAX) continue;
+            }
             static const uint32_t render_scale = [] {
                 const char* e = std::getenv("PROSPER_RENDER_SCALE");
                 const long v = e ? std::strtol(e, nullptr, 10) : 1;
@@ -6688,10 +6781,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->width, r->height, r->depth, 16);
             // Diagnostic: force the proving (poison) path on every eligible dispatch, never fast-skip.
             static const bool force_verify = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
-            if (bi.storage && seed_skip_enabled && !image_descriptors[i].readable &&
-                image_descriptors[i].writable && enough_threads) {
-                const SeedCoverageKey proof_key{item.code_addr, bi.binding,
-                                                r->width, r->height, r->depth};
+            // A write-only descriptor can share this image with a readable sibling. Poisoning
+            // would corrupt values consumed during execution even if writeback later restored the
+            // untouched image texels. Decide from the whole group before consulting ANY proof.
+            if (bi.storage && seed_skip_enabled &&
+                image_alias_plan.groups[image_alias_plan.group_for_image[i]].can_discard_seed() &&
+                enough_threads) {
+                const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                 bool proven_full = false, proven_none = false, known = false, reprove_due = false;
                 {
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
@@ -6953,41 +7049,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!bi.storage && same_view)
                     same_sampler = prosper::gpu::shader_resource_same_sampler(*p, *r);
                 if (!same_view || !same_sampler) continue;
-                bi.alias_of = prior.alias_of == SIZE_MAX ? j : prior.alias_of;
-                const BoundImage& owner = images[bi.alias_of];
-                bi.image = owner.image; bi.memory = owner.memory; bi.view = owner.view;
-                bi.sampler = owner.sampler; bi.guest_bytes = owner.guest_bytes;
-                bi.texel_depth = owner.texel_depth;
-                bi.array_layers = owner.array_layers;
-                bi.mip_levels = owner.mip_levels;
-                bi.mip_staging_offsets = owner.mip_staging_offsets;
-                bi.dcc_metadata = owner.dcc_metadata;
-                bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
-                staging_bytes[i] = staging_bytes[bi.alias_of];
-                if (trace)
-                    std::fprintf(stderr, "[compute]   image-alias binding=%u -> binding=%u addr=0x%llx\n",
-                                 bi.binding, owner.binding, (unsigned long long)r->gpu_addr);
+                bind_image_alias(i, j, image_start);
                 break;
             }
-            if (bi.alias_of != SIZE_MAX) {
-                const BoundImage& alias_owner = images[bi.alias_of];
-                if (image_timing)
-                    std::fprintf(stderr,
-                                 "[compute-image] code=0x%llx hash=0x%016llx "
-                                 "binding=%u class=%s alias=1 addr=0x%llx alias_of=%u "
-                                 "persistent=%u upload-skipped=%u "
-                                 "extent=%ux%ux%u ms=%.3f\n",
-                                 (unsigned long long)item.code_addr,
-                                 (unsigned long long)timing_program_hash, bi.binding,
-                                 bi.storage ? "storage" : "sampled",
-                                 (unsigned long long)r->gpu_addr, alias_owner.binding,
-                                 alias_owner.persistent ? 1u : 0u,
-                                 alias_owner.upload_skipped ? 1u : 0u,
-                                 r->width, r->height, r->depth,
-                                 std::chrono::duration<double, std::milli>(
-                                     ComputeClock::now() - image_start).count());
-                continue;
-            }
+            if (bi.alias_of != SIZE_MAX) continue;
             const uint32_t sampled_layers = dim_cube_stacked ? 6u
                                             : dim_2d_array ? r->depth : 1u;
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height *
@@ -10228,8 +10293,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.written_layers_mask = written_layers;
                 bi.near_full_coverage = near_full;
                 {
-                    const SeedCoverageKey proof_key{item.code_addr, bi.binding,
-                                                    r->width, r->height, r->depth};
+                    const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
                     seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0, written_layers, near_full };
@@ -10562,7 +10626,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ctx.validate_cached_image_source(
                         bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
                         bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
-                            native_3d_transfer_enabled());
+                            native_3d_transfer_enabled(),
+                        bi.graphics_sampled_usage && bi.exact_storage_bytes());
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,

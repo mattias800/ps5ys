@@ -3,7 +3,7 @@
 Header-only, Vulkan-free, dependency-light decision logic and instrumentation for the live compute
 backend (`live/live_compute.cpp`) and for the one boundary it shares with the renderer
 (`live/live_renderer.cpp`). Nothing here touches a device, guest memory, or the write-watch
-mechanism: every file answers a question from plain integers and booleans, so it is unit-testable
+mechanism: every file answers a question from plain metadata, so it is unit-testable
 without a GPU. The tests live in `frontends/shared/tests/`.
 
 **Why the decisions live here and not beside their call sites.** `live_compute.cpp` is eleven
