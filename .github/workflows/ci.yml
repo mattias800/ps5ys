@@ -86,6 +86,11 @@ jobs:
       # silently removed 27 tests (~1,700 assertions) from every "green" CI run, including every
       # shader-recompiler and GPU-execution differential. They are designed for a software device
       # (llvmpipe/lavapipe) and run in seconds locally, so CI can run them too.
+      # The live runtime requires Vulkan 1.4; Ubuntu 24.04's headers/loader are 1.3.
+      # Keep the distribution's Mesa ICD and validation layer for the existing test baseline.
+      - name: Set up Vulkan 1.4
+        uses: ./.github/actions/setup-vulkan
+
       - name: Configure
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON
 
@@ -584,6 +589,11 @@ jobs:
             libpulse-dev libasound2-dev libavformat-dev libavcodec-dev libavutil-dev \
             libswresample-dev libswscale-dev libva-dev
 
+      # The live runtime requires Vulkan 1.4; Ubuntu 24.04's headers/loader are 1.3.
+      # Keep the distribution's Mesa ICD and validation layer for the existing test baseline.
+      - name: Set up Vulkan 1.4
+        uses: ./.github/actions/setup-vulkan
+
       - name: Configure
         run: cmake -S prosper -B prosper/build-app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
 
@@ -623,6 +633,11 @@ jobs:
             libpulse-dev libasound2-dev libavformat-dev libavcodec-dev libavutil-dev \
             libswresample-dev libswscale-dev libva-dev \
             desktop-file-utils file binutils
+
+      # The live runtime requires Vulkan 1.4; Ubuntu 24.04's headers/loader are 1.3.
+      # Keep the distribution's Mesa ICD and validation layer for the existing test baseline.
+      - name: Set up Vulkan 1.4
+        uses: ./.github/actions/setup-vulkan
 
       - name: Configure
         run: >-

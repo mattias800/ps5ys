@@ -1669,6 +1669,24 @@ which trap 38 correctly refuses to accept as an attribution.
    to SPIR-V. The other large piece.
 5. **libSceAmpr audio.** Mix/output via a host audio backend (or a null sink first).
 
+## Sonic Frontiers shader validation (2026-09-07, #3416 / #3417)
+
+The captured position-only guest vertex program contains no PARAM export, while its paired fragment
+program consumes attribute zero. Sticky input controls select PARAM0; they do not request
+`DEFAULT_VAL`. The vertex recompiler now declares every proven consumed location even when the guest
+never writes it. This satisfies Vulkan's interface contract without inserting an invented default
+or overwriting a real export. Unknown consumption does not expand the interface from stale controls.
+
+The renderer and standalone compute device also enable `shaderImageGatherExtended` when supported,
+matching the recompiler's existing dynamic-offset gather capability (#3417). A 105-second baseline
+reported the missing gather feature and missing vertex-output VUIDs. After both fixes and #3415, a
+45-second windowed intro run presented 451 frames with the validation messenger active and **zero
+warnings or errors**. This covers that intro path, not the entire game's shader set.
+
+`vertex_output_budget` checks that a consumed-but-unexported parameter has a declaration and no
+fabricated store, while a real export still writes it. `spv_validate` validates the new module shape;
+`interp_render` verifies real interpolants and explicit defaults still render correctly (3/3 tests).
+
 ## Testing
 
 Everything above must stay behind programmatic checks (agentic-first). Current suite (7 tests):

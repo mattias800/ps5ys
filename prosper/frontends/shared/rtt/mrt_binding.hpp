@@ -5,6 +5,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/state/render_state.hpp"
 #include "shared/rtt/mrt_extent.hpp"
+#include "shared/rtt/rtt_scale.hpp"
 
 // THE definition of an active colour binding.
 //
@@ -303,12 +304,14 @@ bool mrt_draw_binds_target(const prosper::gpu::DrawItem& draw, uint64_t addr,
 template <typename FormatDefined>
 bool mrt_direct_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
                        uint32_t sampled_width, uint32_t sampled_height,
-                       bool is_storage_image, uint32_t img_dim, bool extent_compatible,
+                       bool is_storage_image, uint32_t img_dim, uint32_t layers,
+                       uint32_t samples, bool extent_compatible,
                        bool has_persistent_target, FormatDefined format_defined,
                        bool feedback_copy_supported = false) {
     const bool feedback = mrt_draw_binds_target_view(
         draw, sampled, sampled_width, sampled_height, format_defined);
-    return !is_storage_image && img_dim == 1u && extent_compatible && has_persistent_target &&
+    return !is_storage_image && rtt_single_layer_sample_shape(img_dim, layers, samples) &&
+           extent_compatible && has_persistent_target &&
            (!feedback || feedback_copy_supported);
 }
 

@@ -15,7 +15,44 @@ static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
                               else         { printf("  [ok]   %s\n", msg); } } while (0)
 
+static uint32_t loader_version = VK_API_VERSION_1_0;
+static VkResult loader_result = VK_SUCCESS;
+static bool loader_has_enumerator = true;
+static VKAPI_ATTR VkResult VKAPI_CALL fake_enumerate_version(uint32_t* version) {
+    *version = loader_version;
+    return loader_result;
+}
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_instance_proc(
+        VkInstance instance, const char* name) {
+    CHECK(instance == VK_NULL_HANDLE, "loader version lookup uses no instance");
+    CHECK(std::string(name) == "vkEnumerateInstanceVersion", "looks up the version enumerator");
+    return loader_has_enumerator
+        ? reinterpret_cast<PFN_vkVoidFunction>(fake_enumerate_version) : nullptr;
+}
+
 int main() {
+    // A modern physical device cannot rescue an old loader. Exercise the query failure and
+    // missing-entry-point cases without needing an old driver installed on the test machine.
+    using prosper::frontend::require_vulkan_runtime_loader;
+    loader_has_enumerator = false;
+    CHECK(!require_vulkan_runtime_loader("test", fake_get_instance_proc),
+          "Vulkan 1.0 loader without a version enumerator is rejected");
+    loader_has_enumerator = true;
+    for (uint32_t version : {VK_API_VERSION_1_1, VK_API_VERSION_1_2, VK_API_VERSION_1_3}) {
+        loader_version = version;
+        CHECK(!require_vulkan_runtime_loader("test", fake_get_instance_proc),
+              "pre-1.4 loader is rejected before instance creation");
+    }
+    loader_version = VK_API_VERSION_1_4;
+    CHECK(require_vulkan_runtime_loader("test", fake_get_instance_proc), "1.4 loader accepted");
+    loader_version = VK_MAKE_API_VERSION(0, 1, 4, 354);
+    CHECK(require_vulkan_runtime_loader("test", fake_get_instance_proc), "newer patch accepted");
+    loader_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    CHECK(!require_vulkan_runtime_loader("test", fake_get_instance_proc),
+          "failed enumeration rejects even a returned modern version");
+    CHECK(!prosper::frontend::vulkan_runtime_version_supported(VK_MAKE_API_VERSION(1, 1, 4, 0)),
+          "a different API variant does not satisfy the Vulkan runtime contract");
+
     // Mirrored compute publication invalidates every overlapping cached interpretation, then
     // re-authorizes only the exact renderer image that received the device-local copy.
     {
@@ -127,10 +164,27 @@ int main() {
     const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
     if (!ctx.ok) {
         printf("test_shared_vulkan_device: no Vulkan device available, skipping\n");
-        return 0;                       // CI images without a usable ICD skip rather than fail
+        return fails ? 1 : 0;           // No ICD skips GPU assertions, not the loader controls above.
     }
 
     const prosper::gpu::SharedVulkanContext shared = prosper::gpu::shared_vulkan_context();
+    VkPhysicalDeviceProperties physical_properties{};
+    vkGetPhysicalDeviceProperties(ctx.phys, &physical_properties);
+    CHECK(prosper::frontend::vulkan_runtime_version_supported(physical_properties.apiVersion),
+          "published physical device satisfies the 1.4 runtime floor");
+    VkPhysicalDeviceVulkan12Features core12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features core13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 core_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    core_features.pNext = &core12;
+    core12.pNext = &core13;
+    vkGetPhysicalDeviceFeatures2(ctx.phys, &core_features);
+    CHECK(ctx.descriptor_indexing == (core12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE),
+          "descriptor indexing admission follows the core feature bit");
+    CHECK(ctx.storage_buffer_int64_atomics ==
+              (core_features.features.shaderInt64 && core12.shaderBufferInt64Atomics),
+          "buffer int64 atomic admission follows both required core bits");
+    CHECK(ctx.subgroup_size_control == (core13.subgroupSizeControl == VK_TRUE),
+          "subgroup size admission follows the core feature bit");
     CHECK(shared.valid(), "renderer publishes a valid shared context once initialized");
     CHECK(shared.device == static_cast<void*>(ctx.dev), "published device is the renderer's device");
     CHECK(shared.queue == static_cast<void*>(ctx.queue), "published queue is the renderer's queue");
