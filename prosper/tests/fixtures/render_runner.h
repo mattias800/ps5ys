@@ -3,7 +3,8 @@
 // pixels. Used to verify recompiled shaders end-to-end (render -> readback -> pixel asserts). The
 // including test links Vulkan::Vulkan.
 #pragma once
-#include <thread>   // #3407: parallel_render_memcpy
+#include <system_error>   // #3407: the catch in parallel_render_memcpy
+#include <thread>         // #3407: parallel_render_memcpy
 #include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
