@@ -1324,6 +1324,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         // honest outcome is the layer error, not a silently miscompiled shader.
         if (supported.shaderInt64)      feats.shaderInt64 = VK_TRUE;
         if (supported.independentBlend) feats.independentBlend = VK_TRUE;
+        // Dynamic texel offsets on OpImageGather require ImageGatherExtended (#3417).
+        feats.shaderImageGatherExtended = supported.shaderImageGatherExtended;
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
         r.max_compute_workgroup_size_x = phys_props.limits.maxComputeWorkGroupSize[0];
         r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;

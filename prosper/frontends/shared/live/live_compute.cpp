@@ -3112,6 +3112,8 @@ struct VulkanComputeContext {
         VkPhysicalDeviceFeatures enabled{};
         enabled.robustBufferAccess = VK_TRUE;
         enabled.shaderInt64 = supported.shaderInt64;
+        // The standalone device must enable the same gather capability as the shared renderer.
+        enabled.shaderImageGatherExtended = supported.shaderImageGatherExtended;
         // Image bindings (#590): enable the format-free storage-image features when available.
         image_support = supported.shaderStorageImageReadWithoutFormat &&
                         supported.shaderStorageImageWriteWithoutFormat;
