@@ -3,6 +3,7 @@
 // pixels. Used to verify recompiled shaders end-to-end (render -> readback -> pixel asserts). The
 // including test links Vulkan::Vulkan.
 #pragma once
+#include <thread>   // #3407: parallel_render_memcpy
 #include "host/memory/guest_write_watch.hpp"   // VA->phys for the #2932 target census
 #include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
@@ -2410,6 +2411,50 @@ struct RenderMemoryPoolStats {
 inline RenderMemoryPool& render_memory_pool() {
     static RenderMemoryPool pool;
     return pool;
+}
+
+// #3407: a 4K texture upload is a single ~33 MB memcpy into mapped staging, and it was running on
+// one core while the rest of the machine idled -- 16.96% of the whole profile on Sonic Frontiers'
+// intro, measured as the caller of __memmove. The compute side already had this treatment
+// (parallel_compute_texels); the renderer had no threading at all.
+//
+// Deliberately simple: disjoint destination ranges, every worker joined before the function
+// returns, so the copy is complete before the caller unmaps or submits. Small copies stay on the
+// calling thread, because thread creation would cost more than the copy.
+inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
+    static const unsigned configured = [] {
+        const char* value = getenv("PROSPER_RENDER_COPY_THREADS");
+        if (!value || !*value) return 0u;
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        return static_cast<unsigned>(std::min(parsed, 32ul));
+    }();
+    // Below this the copy is not worth splitting; above it the win is real and bandwidth-bound,
+    // which is why the worker count is capped rather than scaled to the core count.
+    constexpr size_t kMinParallelBytes = 2u << 20;
+    const unsigned hardware = std::thread::hardware_concurrency();
+    const unsigned wanted = configured ? configured
+                                       : std::min(hardware ? hardware : 4u, 8u);
+    if (bytes < kMinParallelBytes || wanted <= 1) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+    const unsigned threads = static_cast<unsigned>(
+        std::min<size_t>(wanted, bytes / (1u << 20)));
+    if (threads <= 1) { std::memcpy(dst, src, bytes); return; }
+    const size_t chunk = (bytes + threads - 1) / threads;
+    std::vector<std::thread> workers;
+    workers.reserve(threads - 1);
+    for (unsigned t = 1; t < threads; ++t) {
+        const size_t begin = std::min(bytes, static_cast<size_t>(t) * chunk);
+        const size_t end = std::min(bytes, begin + chunk);
+        if (begin >= end) break;
+        workers.emplace_back([dst, src, begin, end] {
+            std::memcpy(static_cast<uint8_t*>(dst) + begin,
+                        static_cast<const uint8_t*>(src) + begin, end - begin);
+        });
+    }
+    std::memcpy(dst, src, std::min(bytes, chunk));   // this thread takes the first chunk
+    for (std::thread& worker : workers) worker.join();
 }
 
 inline bool render_memory_pool_enabled() {
@@ -7925,7 +7970,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             "bytes); skipping this upload\n", r.tw, r.th,
                                             (unsigned long long)tbytes);
                                 } else if (r.tex_rgba) {
-                                    std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                                    parallel_render_memcpy(sp, r.tex_rgba,
+                                                           static_cast<size_t>(tbytes));
                                 } else {
                                     // Only a declined/missed depth-plane borrow reaches the creation
                                     // path with no CPU pixels (#1275: the bridge deliberately carries
