@@ -5001,6 +5001,153 @@ int main() {
     set_live_target_reader({});
     set_live_target_query({});
 
+    // Exact write-only storage aliases must fold before their independent RTT seed preparation.
+    // The two stores cover different rows through different bindings: losing either store or
+    // splitting the Vulkan image cannot satisfy the byte oracle. Only the canonical owner proves
+    // coverage, so an alias must not repeatedly request a snapshot for its never-published proof.
+    auto check_write_only_rtt_alias = [&](uint32_t height, uint64_t code_addr) {
+        const bool full = height == 2;
+        const bool allow_warm_seed_skip =
+            std::getenv("PROSPER_NO_SKIP_SEED") == nullptr &&
+            std::getenv("PROSPER_VERIFY_SEED_SKIP") == nullptr &&
+            prosper::frontend::seed_reprove_interval_from_env(
+                std::getenv("PROSPER_SEED_REPROVE"), 256u) != 1;
+        static const uint32_t alias_rows[] = {
+            0x7E080300u,              // v4 = x from the local ID
+            0x7E0A0280u,              // v5 = 0: owner writes row zero
+            0x7E0002F2u,              // v0 = 1.0f (red)
+            0x7E020280u,              // v1 = 0
+            0x7E040280u,              // v2 = 0
+            0x7E0602F2u,              // v3 = 1.0f (alpha)
+            0xF0200F08u, 0x00020004u, // IMAGE_STORE through s[8:15], binding 5
+            0x7E0A0281u,              // v5 = 1: alias writes row one
+            0x7E000280u,              // v0 = 0
+            0x7E0202F2u,              // v1 = 1.0f (green)
+            0xF0200F08u, 0x00040004u, // IMAGE_STORE through s[16:23], binding 6
+            0xBF810000u,
+        };
+        std::vector<uint8_t> destination(static_cast<size_t>(W) * height * 4, 0xC7);
+        auto snapshot_bytes = std::make_shared<std::vector<uint8_t>>(destination.size());
+        for (size_t byte = 0; byte < snapshot_bytes->size(); ++byte)
+            (*snapshot_bytes)[byte] = static_cast<uint8_t>(byte * 13 + 29);
+        const uint64_t address = reinterpret_cast<uint64_t>(destination.data());
+        ShaderResourceTable table;
+        for (uint32_t binding = 5; binding <= 6; ++binding) {
+            ShaderResource resource{};
+            resource.cls = ResourceClass::StorageImage;
+            resource.img_dim = 1;
+            resource.binding = binding;
+            resource.sgpr_base = binding == 5 ? 8 : 16;
+            resource.format = DataFormat::Unorm8;
+            resource.num_components = 4;
+            resource.width = W;
+            resource.height = height;
+            resource.depth = 1;
+            resource.gpu_addr = address;
+            resource.size = static_cast<uint32_t>(destination.size());
+            table.resources.push_back(resource);
+        }
+        ComputeShaderConfig config;
+        config.user_sgprs.resize(24);
+        config.local_x = W;
+        config.local_y = config.local_z = 1;
+        config.tidig_comp_cnt = 0;
+        config.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Unorm8, 4);
+        const std::vector<uint32_t> spirv =
+            recompile_compute(alias_rows, std::size(alias_rows), &table, config);
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            spirv, &table, 0, SpirvShaderStage::Compute, false);
+        const bool write_only_aliases = !spirv.empty() && report.ok() &&
+            report.descriptors.size() == 2 &&
+            std::all_of(report.descriptors.begin(), report.descriptors.end(),
+                [](const SpirvDescriptorBinding& descriptor) {
+                    return descriptor.kind == SpirvDescriptorKind::StorageImage &&
+                           descriptor.writable && !descriptor.readable &&
+                           descriptor.storage_float;
+                });
+        CHECK(write_only_aliases,
+              "RTT alias fixture reflects two native write-only storage bindings");
+        if (!write_only_aliases) return;
+
+        ComputeItem item;
+        item.spirv = spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(table);
+        item.launch.threads_x = item.launch.local_x = W;
+        item.launch.groups_x = 1;
+        item.launch.threads_y = item.launch.threads_z = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = code_addr;
+        uint32_t queries = 0, reads = 0, notifications = 0;
+        bool fail_reader = false;
+        set_live_target_query([&](uint64_t candidate) {
+            if (candidate != address) return false;
+            ++queries;
+            return true;
+        });
+        set_live_target_reader([&](uint64_t candidate, LiveTargetSnapshot& snapshot) {
+            if (candidate != address) return false;
+            ++reads;
+            if (fail_reader) return false;
+            snapshot.width = W;
+            snapshot.height = height;
+            snapshot.format = LiveTargetPixelFormat::Rgba8Unorm;
+            snapshot.pixels = snapshot_bytes;
+            return true;
+        });
+        set_guest_gpu_write_observer([&](uint64_t written_addr, uint64_t bytes, const char*) {
+            if (written_addr == address && bytes == destination.size()) ++notifications;
+        });
+        for (uint32_t run = 0; run < 2; ++run) {
+            const bool unused_reader = full && run != 0 && allow_warm_seed_skip;
+            queries = reads = notifications = 0;
+            // A fresh guest mirror must not satisfy the result oracle without actual writeback.
+            std::fill(destination.begin(), destination.end(), 0xC7);
+            if (run) {
+                for (uint8_t& byte : *snapshot_bytes) byte ^= 0x6D;
+            }
+            fail_reader = unused_reader;
+            std::vector<uint8_t> expected = *snapshot_bytes;
+            for (uint32_t x = 0; x < W; ++x) {
+                const size_t first = static_cast<size_t>(x) * 4;
+                const size_t second = (static_cast<size_t>(W) + x) * 4;
+                expected[first] = 255; expected[first + 1] = expected[first + 2] = 0;
+                expected[first + 3] = 255;
+                expected[second] = expected[second + 2] = 0;
+                expected[second + 1] = expected[second + 3] = 255;
+            }
+            const bool executed = prosper::frontend::execute_live_compute_items({item});
+            CHECK(executed, unused_reader
+                  ? "warm full RTT aliases execute even when an unused snapshot reader would fail"
+                  : "RTT aliases execute with the required canonical snapshot seed");
+            CHECK(destination == expected, full
+                  ? "both write-only aliases contribute their exact distinct output rows"
+                  : "partial write-only aliases preserve the untouched row from the current RTT seed");
+            CHECK(reads == (unused_reader ? 0u : 1u), unused_reader
+                  ? "warm full RTT aliases request no discarded CPU snapshot"
+                  : "RTT alias proving or partial run requests exactly one owner snapshot");
+            CHECK(queries == 2,
+                  "both RTT storage bindings retain their ownership query and pending-write drain");
+            CHECK(notifications == 1,
+                  "exact RTT storage aliases publish one canonical guest-write notification");
+        }
+        if (!full) {
+            const std::vector<uint8_t> before_failure = destination;
+            reads = notifications = 0;
+            fail_reader = true;
+            CHECK(!prosper::frontend::execute_live_compute_items({item}),
+                  "partial RTT alias dispatch still rejects a missing authoritative seed");
+            CHECK(reads == 1 && notifications == 0 && destination == before_failure,
+                  "failed partial RTT alias seed leaves guest bytes and write notifications untouched");
+        }
+        set_guest_gpu_write_observer({});
+        set_live_target_reader({});
+        set_live_target_query({});
+    };
+    check_write_only_rtt_alias(2, 0x590EA10u);
+    check_write_only_rtt_alias(3, 0x590EA11u);
+
     // The exact packed fallback must obey the same authority rule. Keep stale zeroes in guest RAM,
     // publish distinct R11G11B10 renderer pixels, overwrite only row zero, and require every other
     // row to survive from the snapshot rather than the stale allocation.
