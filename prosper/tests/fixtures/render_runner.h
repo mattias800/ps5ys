@@ -2422,11 +2422,14 @@ inline RenderMemoryPool& render_memory_pool() {
 // returns, so the copy is complete before the caller unmaps or submits. Small copies stay on the
 // calling thread, because thread creation would cost more than the copy.
 inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
-    static const unsigned configured = [] {
+    static const unsigned configured = []() -> unsigned {
+        // env_numeric, not strtoul: a malformed or negative value must keep the default rather
+        // than wrap. "-1" through strtoul is 32 workers, which is the opposite of what a reader
+        // setting it to -1 to "turn it off" would expect.
         const char* value = getenv("PROSPER_RENDER_COPY_THREADS");
-        if (!value || !*value) return 0u;
-        const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        return static_cast<unsigned>(std::min(parsed, 32ul));
+        const uint64_t parsed = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_RENDER_COPY_THREADS", value, 0ull, 32ull, "threads");
+        return static_cast<unsigned>(parsed);
     }();
     // Below this the copy is not worth splitting; above it the win is real and bandwidth-bound,
     // which is why the worker count is capped rather than scaled to the core count.
@@ -2442,19 +2445,39 @@ inline void parallel_render_memcpy(void* dst, const void* src, size_t bytes) {
         std::min<size_t>(wanted, bytes / (1u << 20)));
     if (threads <= 1) { std::memcpy(dst, src, bytes); return; }
     const size_t chunk = (bytes + threads - 1) / threads;
-    std::vector<std::thread> workers;
+
+    // jthread plus a synchronous tail, mirroring parallel_compute_texels. Two failures have to be
+    // survived and they pull in opposite directions: if pthread_create fails, a plain
+    // std::vector<std::thread> would destroy a joinable thread while unwinding and call
+    // std::terminate() -- in the LIVE RENDERER, on a path whose predecessor (a bare memcpy) could
+    // not fail at all. But merely catching would be worse than aborting: the ranges that never got
+    // a worker would go uncopied and the texture would be silently wrong. So every range that did
+    // not get a thread is copied on this thread below, and transient resource pressure degrades to
+    // less parallelism instead of either a crash or corruption.
+    std::vector<std::jthread> workers;
     workers.reserve(threads - 1);
-    for (unsigned t = 1; t < threads; ++t) {
-        const size_t begin = std::min(bytes, static_cast<size_t>(t) * chunk);
-        const size_t end = std::min(bytes, begin + chunk);
-        if (begin >= end) break;
-        workers.emplace_back([dst, src, begin, end] {
-            std::memcpy(static_cast<uint8_t*>(dst) + begin,
-                        static_cast<const uint8_t*>(src) + begin, end - begin);
-        });
+    unsigned next_worker = 1;
+    try {
+        for (; next_worker < threads; ++next_worker) {
+            const size_t begin = std::min(bytes, static_cast<size_t>(next_worker) * chunk);
+            const size_t end = std::min(bytes, begin + chunk);
+            if (begin >= end) break;
+            workers.emplace_back([dst, src, begin, end] {
+                std::memcpy(static_cast<uint8_t*>(dst) + begin,
+                            static_cast<const uint8_t*>(src) + begin, end - begin);
+            });
+        }
+    } catch (const std::system_error&) {
+        // Fall through: ranges that did not get a worker are copied synchronously below.
     }
     std::memcpy(dst, src, std::min(bytes, chunk));   // this thread takes the first chunk
-    for (std::thread& worker : workers) worker.join();
+    for (; next_worker < threads; ++next_worker) {
+        const size_t begin = std::min(bytes, static_cast<size_t>(next_worker) * chunk);
+        const size_t end = std::min(bytes, begin + chunk);
+        if (begin >= end) break;
+        std::memcpy(static_cast<uint8_t*>(dst) + begin,
+                    static_cast<const uint8_t*>(src) + begin, end - begin);
+    }
 }
 
 inline bool render_memory_pool_enabled() {
