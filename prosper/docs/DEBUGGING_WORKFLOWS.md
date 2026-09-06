@@ -134,16 +134,20 @@ time to — the question stops being "which function" and becomes "why is only o
 Read it from `/proc/<pid>/stat` (utime+stime deltas) or `pidstat`, and take it before the flame
 graph: it is one number, it cannot be misattributed by a truncated unwind, and it rules out a whole
 class of answers. *Sonic Frontiers* at 3.3 fps sat at **1.01 of 32 cores** with `gpu-device` at 5.4%
-of the window, which said "serial host work" before any symbol was read; three serial per-texel
-conversion loops were the cause (#3405).
+of the window, which said "serial host work" before any symbol was read. The cause was three separate
+single-threaded stretches and only one of them was a conversion: a staging mapping torn down and
+refaulted every frame (#3406), six unparallelised per-texel conversion arms, and a single-threaded
+33 MB staging memcpy (both #3408). #3405.
 
 **A widely used parallel helper is not evidence that the chain you are profiling uses it — count
 the call sites against the loops of that shape.** `parallel_compute_texels` was already live at
-**fifteen** sites in `frontends/shared/live/live_compute.cpp`, which is exactly what makes the gap
-invisible: the *sampled* conversion chain has seven per-texel arms and exactly **one** of them was
-wrapped, so six 4K scalar loops sat among wrapped neighbours and read as parallel to anyone who
+**fourteen** call sites in `frontends/shared/live/live_compute.cpp`, which is exactly what makes the
+gap invisible: the *sampled* conversion chain has seven per-texel arms and exactly **one** of them
+was wrapped, so six 4K scalar loops sat among wrapped neighbours and read as parallel to anyone who
 found the helper first. Grep for the helper, then grep for the loop shape it wraps, and compare the
-counts **within the chain you are measuring**, not across the file. #3408.
+counts **within the chain you are measuring**, not across the file. Count call sites, not grep
+hits — the helper's own definition is one of them, which is how this paragraph first said fifteen.
+#3408.
 
 ### Stalled loading and waits
 
