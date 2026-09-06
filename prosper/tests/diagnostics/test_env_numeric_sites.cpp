@@ -286,6 +286,11 @@ static const Site kSites[] = {
      mib_cap_new<1024>, mib_cap_old<1024>, "eight", 1024ull * kMiB, "2048", 2048ull * kMiB},
     {"render_runner.h PROSPER_MEMORY_POOL_MB", "PROSPER_MEMORY_POOL_MB",
      mib_cap_new<512>, mib_cap_old<512>, "-1", 512ull * kMiB, "256", 256ull * kMiB},
+    // #3405: the mapped-staging cache's own budget, accounted separately from the transient pool
+    // above so peak retained host memory is the sum of the two rather than one figure standing in
+    // for both. A malformed value must keep the default rather than disable the bound.
+    {"render_runner.h PROSPER_MAPPED_STAGING_MB", "PROSPER_MAPPED_STAGING_MB",
+     mib_cap_new<256>, mib_cap_old<256>, "-1", 256ull * kMiB, "512", 512ull * kMiB},
 
     {"render_runner.h PROSPER_BACKEND_BUFFER_ARENA_KB", "PROSPER_BACKEND_BUFFER_ARENA_KB",
      arena_new, arena_old, "4mb", 1024ull * 1024ull, "2048", 2048ull * 1024ull},
