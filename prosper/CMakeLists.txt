@@ -1339,6 +1339,13 @@ if(TARGET prosper_core)
   target_include_directories(test_compute_image_borrow_census PRIVATE frontends)
   add_test(NAME compute_image_borrow_census COMMAND test_compute_image_borrow_census)
 
+  # Storage-image alias access union is metadata-only and must run without Vulkan on every platform.
+  add_executable(test_storage_image_alias_plan
+                 frontends/shared/tests/test_storage_image_alias_plan.cpp)
+  target_include_directories(test_storage_image_alias_plan PRIVATE frontends src)
+  target_link_libraries(test_storage_image_alias_plan PRIVATE prosper_core)
+  add_test(NAME storage_image_alias_plan COMMAND test_storage_image_alias_plan)
+
   add_executable(test_texture_decode_diagnostic
                  frontends/shared/tests/test_texture_decode_diagnostic.cpp)
   target_include_directories(test_texture_decode_diagnostic PRIVATE frontends src)
