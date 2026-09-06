@@ -52,6 +52,32 @@ that `make_shader_compile_key` computed a provisional hash which all three calle
 overwrote after attaching diagnostic settings. Removing that first calculation preserves the final key,
 equality checks and shader output. End-to-end performance improvement is not yet established.
 
+### Kernel attribution and writable permission queries (#3398)
+
+A native Performance Story calibration on source-equivalent `769a599b1` / executable
+`8185b421` retained the rendered bank scene and complete F8/F9 captures without device loss.
+The earlier whole-process inheriting 299 Hz profile coincided with about 2.02 process system
+CPU cores in its recording bracket, against roughly 0.28 in neighboring intervals. That
+bracket is **not ordinary gameplay kernel cost**. With 49 Hz user/kernel sampling restricted
+to an identity-pinned thread and inheritance disabled, process system CPU was 0.251 / 0.269 /
+0.259 cores before/during/after. These changes were combined, so they do not isolate the cause
+of the earlier perturbation or prove zero overhead. Thread names alone were ambiguous because
+workers inherited the render-thread name; stable identity and sampled execution stacks
+validated the selected thread. The new capture contains 866 user and 843 kernel samples,
+zero lost records, and verified app/libc/RADV build IDs.
+
+`guest_writable` accounts for 29.0135% of **that thread's sampled kernel-event periods**;
+actual map-read syscall subtrees account for 27.8678%. This is not a whole-process/frame share
+or an FPS prediction. The writable cache already exists: mapping/protection generation changes
+clear its positive ranges, and negative misses are not cached. Linux misses previously generated
+and parsed the entire textual process map.
+
+The exact-cover Linux query path in #3398 checks only the requested writable VMAs, retaining
+generation invalidation, read-only/hole refusal and full-request text fallback when the binary
+interface is unavailable. It warms only the proven span, not every writable VMA as the text
+path does; net performance must therefore be measured. Native comparison evidence belongs to
+#3398 and the broader resource-budget investigation remains #3065.
+
 ### Duplicate storage-image preparation (#3065)
 
 On merged `805b49d53`, a later native Performance Story F8 isolated **3.512 ms** in the first

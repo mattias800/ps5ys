@@ -1993,6 +1993,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
   add_test(NAME guest_memory_map COMMAND test_guest_memory_map)
 
+  add_executable(test_guest_memory_query tests/host/memory/test_guest_memory_query.cpp)
+  target_link_libraries(test_guest_memory_query PRIVATE prosper_core)
+  add_test(NAME guest_memory_query COMMAND test_guest_memory_query)
+
   # #3142: the chunked guest-memory content scan. The straddling case is the one that earns the
   # test -- a scanner that drops its overlap still returns a plausible hit list, so the blindness
   # is invisible in a live run and turns a "not found" into a wrong answer.
@@ -2026,6 +2030,13 @@ if(TARGET prosper_core)
   # sources are handed to the wiring check, which confirms no protection change in the handler
   # bypasses the notifying wrapper and that the notifier is still lock-free.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_guest_writable_query_adapter
+      tests/host/memory/test_guest_writable_query_adapter.cpp)
+    target_link_libraries(test_guest_writable_query_adapter PRIVATE prosper_core)
+    target_link_options(test_guest_writable_query_adapter PRIVATE "-Wl,--wrap=ioctl")
+    add_test(NAME guest_writable_query_adapter COMMAND ${CMAKE_COMMAND} -E env
+      --unset=PROSPER_NO_GUEST_WRITE_CACHE $<TARGET_FILE:test_guest_writable_query_adapter>)
+
     add_executable(test_watch_mapping_generation tests/host/memory/test_watch_mapping_generation.cpp)
     target_link_libraries(test_watch_mapping_generation PRIVATE prosper_core)
     target_compile_definitions(test_watch_mapping_generation PRIVATE

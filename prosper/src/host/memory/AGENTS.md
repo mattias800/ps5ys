@@ -10,6 +10,9 @@ whatever ended up mapped, without any opinion on why.
   dereferencing a guest pointer, plus the mapping *generation* counter that invalidates them. The
   generation is the load-bearing part: every change to guest page protection, from anywhere in the
   tree, must advance it or a cache serves a stale answer about a page that has since been revoked.
+- **`guest_memory_query.{hpp,cpp}`** — uncached, exact-cover writable VMA queries where the host
+  supports them. It reports unavailable separately from non-writable; cache policy and mapping
+  generations remain with its consumers.
 - **`guest_write_watch.{hpp,cpp}`** — write-protection-based dirty tracking for guest pages, and the
   direct-memory write trace that attributes a guest write to the module and RIP that made it. Host
   writes into guest memory (file reads, DMA-shaped producers) must bracket themselves with the
