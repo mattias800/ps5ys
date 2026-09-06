@@ -129,15 +129,19 @@ Use diagnostic runs to find the cause and separate minimally instrumented runs t
 For stopped-stack fallback only: [hostprof](../tools/hostprof/README.md).
 
 **Before profiling symbols, divide by the core count.** A process consuming about **one**
-core-second per wall-second on a many-core box is serial, whatever `perf report` then attributes the
-time to — the question stops being "which function" and becomes "why is only one thread doing this".
-Read it from `/proc/<pid>/stat` (utime+stime deltas) or `pidstat`, and take it before the flame
-graph: it is one number, it cannot be misattributed by a truncated unwind, and it rules out a whole
-class of answers. *Sonic Frontiers* at 3.3 fps sat at **1.01 of 32 cores** with `gpu-device` at 5.4%
-of the window, which said "serial host work" before any symbol was read. The cause was three separate
-single-threaded stretches and only one of them was a conversion: a staging mapping torn down and
-refaulted every frame (#3406), six unparallelised per-texel conversion arms, and a single-threaded
-33 MB staging memcpy (both #3408). #3405.
+core-second per wall-second on a many-core box is doing its work serially, whatever `perf report`
+then attributes the time to — the question stops being "which function" and becomes "why is only one
+thread doing this". Read it from `/proc/<pid>/stat` (utime+stime deltas) or `pidstat`, and take it
+before the flame graph: it is one number and a truncated unwind cannot misattribute it.
+
+**On its own it establishes serialisation, not that serial host work is the bottleneck** — a process
+blocked on the GPU or on I/O reads about one core too, and reads it for the opposite reason. Pair it
+with a device-idle measure before concluding anything. *Sonic Frontiers* at 3.3 fps had all three
+legs: **1.01 of 32 cores**, `gpu-device` at 5.4% of the window, and the main thread only 2.1% on its
+fence — busy, not waiting, and not on the GPU. That said "serial host work" before any symbol was
+read. The cause was three separate single-threaded stretches and only one of them was a conversion: a
+staging mapping torn down and refaulted every frame (#3406), six unparallelised per-texel conversion
+arms, and a single-threaded 33 MB staging memcpy (both #3408). #3405.
 
 **A widely used parallel helper is not evidence that the chain you are profiling uses it — count
 the call sites against the loops of that shape.** `parallel_compute_texels` was already live at
