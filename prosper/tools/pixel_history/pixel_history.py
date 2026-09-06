@@ -4,9 +4,9 @@
 Usage: pixel_history.py CAPTURE --output NEW_DIRECTORY [--pixel X,Y] [--target N]
                         [--expect-control]
 
-Four answers steer completely different investigations, and this separates them:
+Verdicts, each steering a different investigation:
 
-  NOTHING_DREW        no event in the frame touched the pixel -- look upstream at
+  NOTHING_DREW        no DRAW touched the pixel (a clear may have) -- look upstream at
                       geometry, viewport, culling or whether the draw was submitted
   ALL_REJECTED        fragments arrived and every one was thrown out; the report names
                       which test did it (depth, stencil, scissor, discard, cull, ...)
@@ -14,6 +14,14 @@ Four answers steer completely different investigations, and this separates them:
                       resource binding, textures, uniforms, the shader itself
   STORE_LOST_IT       the shader computed a non-black colour and the target ended black
                       anyway -- look at blend state, write masks, later overdraw
+  PIXEL_WAS_WRITTEN   a draw survived and the pixel is not black; not a defect here
+  CLEARED_AFTER_DRAW  draws survived and a later clear wiped them -- what you see is the
+                      clear, not the shading
+  OUTPUT_UNTRUSTED    the explaining event's shader output is undefined (an unbound pixel
+                      shader), so "computed black" and "store lost it" cannot be separated
+
+Clears pass and evaluate no test, so they are never the subject of a verdict -- only the
+ground one is stated against. See instrument trap 269.
 
 Run against `pixel_history_control` first on any new driver: `--expect-control` checks
 this tool's own reading against a construction with a known answer.
@@ -73,16 +81,36 @@ def classify(events):
     """One verdict from the event list. Order matters: the earliest true statement wins."""
     if not events:
         return "NOTHING_DREW", "No event in this frame touched the pixel."
-    passed = [e for e in events if e["passed"]]
+    # A clear is a pixel-history event and it PASSES (trap 269), with no test evaluated.
+    # Reasoning about the pixel from it would answer a question nobody asked: on a target
+    # cleared to black, "the last passing event computed black" is the CLEAR, and reporting
+    # SHADER_WROTE_BLACK sends the reader to a shader that never ran. Clears are therefore
+    # never the subject of a verdict -- only ever the ground a verdict is stated against.
+    drawn = [e for e in events if not e["is_clear"]]
+    if not drawn:
+        cleared = "; the pixel holds its clear value" if events else ""
+        return "NOTHING_DREW", f"only clear events touched this pixel{cleared}."
+    passed = [e for e in drawn if e["passed"]]
     if not passed:
         why = {}
-        for e in events:
+        for e in drawn:
             for r in e["rejected_by"]:
                 why[r] = why.get(r, 0) + 1
         named = ", ".join(f"{k}x{v}" for k, v in sorted(why.items(), key=lambda kv: -kv[1]))
-        return "ALL_REJECTED", f"{len(events)} events reached the pixel, none survived: {named or 'no reason flagged'}."
+        return "ALL_REJECTED", (f"{len(drawn)} draw(s) reached the pixel, none survived: "
+                                f"{named or 'no reason flagged'}.")
 
-    # Only the LAST passing event can explain the pixel's final state. An earlier bright
+    # A clear AFTER the last surviving draw is what the reader is looking at, not the draw.
+    # Blaming the shader for a pixel a later clear wiped is the same error as blaming it for
+    # the ground clear, one ordering along.
+    late = [e for e in events if e["is_clear"] and e["passed"]
+            and e["eventId"] > passed[-1]["eventId"]]
+    if late:
+        return "CLEARED_AFTER_DRAW", (
+            f"{len(passed)} draw(s) passed, then event {late[-1]['eventId']} cleared the "
+            f"target over them -- the pixel you see is the clear, not the shading.")
+
+    # Only the LAST passing draw can explain the pixel's final state. An earlier bright
     # writer that was legitimately overdrawn -- a white sky behind a black object -- is not
     # evidence of a lost store, and reading it as one made SHADER_WROTE_BLACK unreachable
     # on any pixel with history, which is most of a real frame.
@@ -134,11 +162,16 @@ def embedded():
                 "would be indistinguishable from 'nothing drew', so refusing to report one")
 
         actions = []
+        clear_eids = set()
 
         def walk(nodes):
             for a in nodes:
                 if a.flags & rd.ActionFlags.Drawcall:
                     actions.append(a)
+                # Trap 269: a clear is a passing pixel-history event. classify() must be able
+                # to tell it from a draw, and only the action list carries that.
+                if a.flags & rd.ActionFlags.Clear:
+                    clear_eids.add(int(a.eventId))
                 walk(a.children)
 
         walk(ctl.GetRootActions())
@@ -211,6 +244,7 @@ def embedded():
             pre = suppress_shader_output(rejected)
             events.append({
                 "eventId": int(m.eventId),
+                "is_clear": int(m.eventId) in clear_eids,
                 "passed": bool(m.Passed()),
                 "rejected_by": rejected,
                 # Suppressed rather than reported as zero: "the shader ran and produced
@@ -231,6 +265,7 @@ def embedded():
                     rej = [f for f in REJECTIONS if getattr(m, f, False)]
                     pre = suppress_shader_output(rej)
                     ce.append({"eventId": int(m.eventId), "passed": bool(m.Passed()),
+                               "is_clear": int(m.eventId) in clear_eids,
                                "rejected_by": rej,
                                "shaderOut": None if pre else values(m.shaderOut),
                                "shader_output_suppressed": pre,
@@ -282,10 +317,21 @@ def check_control(regions):
     seq = regions.get("A  sequence")
     if seq:
         reasons = [r for e in seq["events"] for r in e["rejected_by"]]
-        for needed in ("depthTestFailed", "shaderDiscarded", "scissorClipped"):
+        for needed in ("depthTestFailed", "shaderDiscarded"):
             if needed not in reasons:
                 problems.append(f"A: {needed} was constructed but not reported; a rejection "
                                 f"is being misattributed")
+        # A's own scissored arm runs BEFORE its last surviving draw; the other regions'
+        # draws are all later. Without the ordering check this requirement is vacuous --
+        # B, C and E supply a scissorClipped at A whether or not arm 2 exists.
+        drawn = [e for e in seq["events"] if not e["is_clear"]]
+        survived = [e for e in drawn if e["passed"]]
+        cutoff = survived[-1]["eventId"] if survived else 0
+        if not any("scissorClipped" in e["rejected_by"] and e["eventId"] < cutoff
+                   for e in drawn):
+            problems.append("A: no scissorClipped event before A's last surviving draw, so "
+                            "arm 2 is missing or misattributed (later regions' draws also "
+                            "scissor-clip here, which is why the ordering matters)")
         # Trap 268: the scissored arm's shaderOut is the PREVIOUS draw's colour. If any
         # positionally-rejected event still carries an output, the suppression is off and the
         # tool is one step from reporting a neighbouring draw's colour as this one's.
@@ -295,6 +341,19 @@ def check_control(regions):
             problems.append(f"A: events {leaked} were rejected before the fragment shader ran "
                             f"and still reported a shader output; the stale-value suppression "
                             f"is not working")
+    killed = regions.get("E  all killed")
+    if killed:
+        # E's verdict alone is reachable with its own draw deleted: the seven scissored
+        # neighbours produce ALL_REJECTED by themselves, and the C self-check sees black
+        # either way. Name the arm the region exists for.
+        if not any("shaderDiscarded" in e["rejected_by"] for e in killed["events"]):
+            problems.append("E: no shaderDiscarded event; the region's own draw is missing "
+                            "and its verdict is coming from scissored neighbours alone")
+        # E is the control's guard for trap 269. If the clear stopped being recognised, its
+        # verdict would silently become SHADER_WROTE_BLACK with the clear as the subject.
+        if not any(e["is_clear"] for e in killed["events"]):
+            problems.append("E: no clear event in the history, so this reading cannot guard "
+                            "the clear-versus-draw distinction (trap 269) at all")
     return problems
 
 
@@ -360,8 +419,10 @@ def main():
             print(f"CONTROL FAILED: {problem}", file=sys.stderr)
         if problems:
             return 1
-        print(f"CONTROL VERIFIED: {len(CONTROL_REGIONS)} regions, every constructed verdict "
-              f"and rejection reason read back correctly.")
+        print(f"CONTROL VERIFIED: {len(CONTROL_REGIONS)} regions, each constructed verdict "
+              f"read back correctly, plus A's depth/discard/scissor arms in order and E's "
+              f"own discard and clear. Rejection reasons are checked in A and E, not in "
+              f"every region.")
 
     print(f"{data['verdict']}: {data['reason']}")
     print(f"  pixel {tuple(data['pixel'])} of {data['target']['width']}x"
@@ -376,7 +437,8 @@ def main():
         # Passed() ignores unboundPS, so an event with no bound pixel shader arrives as a
         # pass. Printing a bare "PASS" would hide the one fact that matters about it.
         undefined = [f for f in e["rejected_by"] if f in UNDEFINED_OUTPUT]
-        state = (("PASS!" + ",".join(undefined)) if e["passed"] and undefined
+        state = ("CLEAR" if e["is_clear"]
+                 else ("PASS!" + ",".join(undefined)) if e["passed"] and undefined
                  else "PASS" if e["passed"]
                  else ",".join(e["rejected_by"]) or "rejected")
         print(f"    eid {e['eventId']:>6}  {state:<20} shaderOut {out}")

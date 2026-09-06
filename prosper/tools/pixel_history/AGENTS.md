@@ -5,7 +5,10 @@ this project's black-render investigations actually turn on: **a pixel is the wr
 colour — did anything draw there at all, was it drawn and thrown away, did the shader run
 and compute black, or did the shader compute a colour that the store then lost?**
 
-Those four answers send you to four different files. Telling them apart by inference —
+Those answers send you to different files. Two more exist for cases that would otherwise be
+misreported: `CLEARED_AFTER_DRAW` (a later clear wiped surviving draws) and
+`OUTPUT_UNTRUSTED` (the explaining event has an unbound pixel shader, so its output is
+undefined and the tool refuses to guess). Telling them apart by inference —
 draw censuses, disabling passes, bisecting state — is what has historically cost this
 project hours per defect, and the census route has produced retracted issues. RenderDoc
 answers it directly, per event, and `pixel_history.py` turns that into one call with one
@@ -19,8 +22,8 @@ What lives here:
   the per-event detail behind it. It refuses to report at all if the replay driver says it
   has no pixel-history support, because an empty history and an unsupported driver look
   identical and mean opposite things.
-- `control.c` + `shaders/` — a construction with a **known answer**, in five regions that each
-  produce a **different verdict**: the draw sequence (`PIXEL_WAS_WRITTEN`), a passing draw that
+- `control.c` + `shaders/` — a construction with a **known answer**, in five regions producing
+  **four different verdicts**: the draw sequence (`PIXEL_WAS_WRITTEN`), a passing draw that
   computes black (`SHADER_WROTE_BLACK`), a passing draw through a `colorWriteMask=0` pipeline
   (`STORE_LOST_IT`), and a region where every draw is discarded (`ALL_REJECTED`). A control that
   only ever produced one verdict would test the machinery and not the distinctions. Run

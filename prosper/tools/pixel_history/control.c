@@ -19,7 +19,7 @@
  *   C  (16,48)  one passing draw, bright,
  *               through a colorWriteMask=0
  *               pipeline                   -> STORE_LOST_IT, final BLACK
- *   E  (48,48)  two draws, both discard    -> ALL_REJECTED
+ *   E  (48,48)  one draw, discarded        -> ALL_REJECTED (with the clear present)
  *
  * Region A's arms, in submission order, at (16,16):
  *
@@ -290,7 +290,7 @@ int main(void)
     if (r) die("vkCreatePipelineLayout", r);
 
     VkPipelineShaderStageCreateInfo stages[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, 
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = vs; stages[0].pName = "main";
@@ -420,17 +420,24 @@ int main(void)
     if (r) die("vkAllocateCommandBuffers", r);
     VkCommandBuffer cmd = cmds[0];
 
+#ifdef PROSPER_PIXHIST_CAPTURE
+    capture_begin(argv[1]);
+#endif
     VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbi);
 
-    /* Black ground by transfer clear, in its OWN submit BEFORE the capture starts.
+    /* Black ground by transfer clear, INSIDE the capture on purpose.
      *
      * MEASURED, not assumed: RenderDoc's Vulkan pixel history reports vkCmdClearColorImage
-     * as a PASSING modification. A clear inside the captured frame therefore gives every
-     * pixel a passing event, which makes ALL_REJECTED unconstructible -- region E read
-     * SHADER_WROTE_BLACK instead, with the clear as its only passing event. Keeping the
-     * clear outside the capture leaves the ground defined and the frame draws-only. */
+     * as a PASSING modification, with no test evaluated (trap 269). That briefly made
+     * region E read SHADER_WROTE_BLACK -- the clear was its only passing event.
+     *
+     * The first fix moved the clear out of the capture, which made the control pass by
+     * removing the phenomenon from it. That is backwards: the tool has to survive this on
+     * every real frame, since every real frame clears its targets. So the clear stays in,
+     * classify() distinguishes clears from draws, and this control now FAILS if that
+     * distinction is ever lost. A control that avoids the hard case guards nothing. */
     VkImageMemoryBarrier pre = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     pre.srcAccessMask = 0;
     pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -464,9 +471,6 @@ int main(void)
     r = vkQueueWaitIdle(g_queue);
     if (r) die("vkQueueWaitIdle(ground)", r);
 
-#ifdef PROSPER_PIXHIST_CAPTURE
-    capture_begin(argv[1]);
-#endif
     cmd = cmds[1];
     vkBeginCommandBuffer(cmd, &cbi);
 

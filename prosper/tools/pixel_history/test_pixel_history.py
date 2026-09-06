@@ -4,16 +4,51 @@ import unittest
 import pixel_history as ph
 
 
-def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1, suppressed=None):
+def clear(post=(0.0, 0.0, 0.0, 1.0), eid=0):
+    """A clear: passes, evaluates no test, and is never the subject of a verdict."""
+    return ev(True, post=post, eid=eid, is_clear=True)
+
+
+def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1, suppressed=None,
+       is_clear=False):
     if suppressed is None:
         suppressed = ph.suppress_shader_output(rejected)
     return {"eventId": eid, "passed": passed, "rejected_by": list(rejected),
+            "is_clear": is_clear,
             "shaderOut": None if suppressed else (None if shader is None else list(shader)),
             "shader_output_suppressed": suppressed,
             "postMod": list(post)}
 
 
 class ClassifyTests(unittest.TestCase):
+    def test_a_cleared_target_that_nothing_drew_to_is_not_a_shader_defect(self):
+        # THE headline case: a black region of a cleared target. The clear passes and its
+        # postMod is black, so reading it as the explaining event returned SHADER_WROTE_BLACK
+        # and sent the reader to a shader that never ran.
+        v, why = ph.classify([clear()])
+        self.assertEqual(v, "NOTHING_DREW")
+        self.assertIn("clear", why)
+
+    def test_a_coloured_clear_that_nothing_drew_to_is_also_nothing_drew(self):
+        # The same defect in its other direction: a sky-blue clear read as PIXEL_WAS_WRITTEN,
+        # retiring the question with "something drew here" when nothing did.
+        self.assertEqual(ph.classify([clear(post=(0.3, 0.6, 0.9, 1))])[0], "NOTHING_DREW")
+
+    def test_a_clear_does_not_rescue_a_pixel_whose_draws_all_failed(self):
+        v, why = ph.classify([clear(), ev(False, ["depthTestFailed"], eid=5)])
+        self.assertEqual(v, "ALL_REJECTED")
+        self.assertIn("1 draw", why)
+
+    def test_a_clear_after_the_last_draw_is_the_thing_you_are_looking_at(self):
+        v, why = ph.classify([ev(True, shader=(1, 1, 1, 1), post=(1, 1, 1, 1), eid=5),
+                              clear(eid=9)])
+        self.assertEqual(v, "CLEARED_AFTER_DRAW")
+        self.assertIn("9", why)
+
+    def test_a_clear_before_the_draws_does_not_change_a_real_verdict(self):
+        drawn = ev(True, shader=(0.7, 0.2, 0.1, 1), post=(0, 0, 0, 1), eid=5)
+        self.assertEqual(ph.classify([clear(), drawn])[0], "STORE_LOST_IT")
+
     def test_no_events_is_not_a_rendering_bug(self):
         v, why = ph.classify([])
         self.assertEqual(v, "NOTHING_DREW")
@@ -86,16 +121,40 @@ class ControlCheckTests(unittest.TestCase):
     """check_control must fail on a wrong READING, not merely on a wrong final picture."""
 
     def regions(self):
-        seq = [ev(True, shader=(0, 1, 0, 1), post=(0, 1, 0, 1), eid=1),
+        seq = [clear(eid=0),
+               ev(True, shader=(0, 1, 0, 1), post=(0, 1, 0, 1), eid=1),
                ev(False, ["scissorClipped"], eid=2),
                ev(False, ["shaderDiscarded"], shader=(0, 0, 0, 0), eid=3),
                ev(True, shader=(1, 1, 0, 1), post=(1, 1, 0, 1), eid=4),
-               ev(False, ["depthTestFailed"], shader=(0, 0, 1, 1), eid=5)]
+               ev(False, ["depthTestFailed"], shader=(0, 0, 1, 1), eid=5),
+               ev(False, ["scissorClipped"], eid=9)]   # a later region's draw
+        killed = [clear(eid=0), ev(False, ["scissorClipped"], eid=1),
+                  ev(False, ["shaderDiscarded"], shader=(0, 0, 0, 0), eid=8)]
         return {"A  sequence": {"verdict": "PIXEL_WAS_WRITTEN", "events": seq},
                 "A' arm-1 only": {"verdict": "PIXEL_WAS_WRITTEN", "events": []},
                 "B  black draw": {"verdict": "SHADER_WROTE_BLACK", "events": []},
                 "C  no write": {"verdict": "STORE_LOST_IT", "events": []},
-                "E  all killed": {"verdict": "ALL_REJECTED", "events": []}}
+                "E  all killed": {"verdict": "ALL_REJECTED", "events": killed}}
+
+    def test_As_own_scissor_arm_must_precede_its_last_surviving_draw(self):
+        # Deleting arm 2 leaves a later region's scissorClipped in A's history, so a check
+        # that only asks "is scissorClipped present" stays green with the arm gone.
+        bad = self.regions()
+        bad["A  sequence"]["events"] = [e for e in bad["A  sequence"]["events"]
+                                        if e["eventId"] != 2]
+        self.assertIn("arm 2", " ".join(ph.check_control(bad)))
+
+    def test_E_must_contain_its_own_discarded_draw(self):
+        bad = self.regions()
+        bad["E  all killed"]["events"] = [e for e in bad["E  all killed"]["events"]
+                                          if "shaderDiscarded" not in e["rejected_by"]]
+        self.assertIn("region's own draw is missing", " ".join(ph.check_control(bad)))
+
+    def test_E_must_contain_a_clear_so_it_guards_trap_269(self):
+        bad = self.regions()
+        bad["E  all killed"]["events"] = [e for e in bad["E  all killed"]["events"]
+                                          if not e["is_clear"]]
+        self.assertIn("trap 269", " ".join(ph.check_control(bad)))
 
     def test_correct_reading_passes(self):
         self.assertEqual(ph.check_control(self.regions()), [])
@@ -117,8 +176,12 @@ class ControlCheckTests(unittest.TestCase):
         # The reading stays well-formed and the verdict stays right; only the REASON is
         # wrong. That is the failure a final-picture check cannot see.
         bad = self.regions()
-        bad["A  sequence"]["events"][4] = ev(False, ["stencilTestFailed"],
-                                             shader=(0, 0, 1, 1), eid=5)
+        # Target by event id, not position: the fixture's indices move whenever the
+        # construction gains an event, and a positional fixture silently retargets.
+        bad["A  sequence"]["events"] = [
+            ev(False, ["stencilTestFailed"], shader=(0, 0, 1, 1), eid=5)
+            if e["eventId"] == 5 else e
+            for e in bad["A  sequence"]["events"]]
         self.assertIn("depthTestFailed", " ".join(ph.check_control(bad)))
 
     def test_unsuppressed_stale_output_is_caught(self):

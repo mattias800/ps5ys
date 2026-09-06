@@ -79,9 +79,11 @@ python3 tools/pixel_history/pixel_history.py "$run_dir"/frame_frame*.rdc \
     --output "$run_dir/pixhist"
 ```
 
-It reports one of `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`
-or `STORE_LOST_IT`, with the per-event detail behind it, and defaults to the brightest pixel rather
-than the centre. On a driver you have not used it on before, run `--expect-control` against
+It reports `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`,
+`STORE_LOST_IT`, `PIXEL_WAS_WRITTEN`, `CLEARED_AFTER_DRAW` or `OUTPUT_UNTRUSTED`, with the per-event
+detail behind it, and defaults to the brightest pixel rather than the centre. Clears are reported but
+are never the subject of a verdict — on a cleared target "the last passing event computed black"
+would otherwise be the clear, and blame a shader that never ran (instrument trap 269). On a driver you have not used it on before, run `--expect-control` against
 `pixel_history_control` first; see [its AGENTS.md](../tools/pixel_history/AGENTS.md) for why that is
 not ceremony.
 
