@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-09-06
 
+### Sonic Frontiers got faster, and the GPU was never the problem
+
+At 3.3 fps the GPU was busy **5.4%** of the time — it was idle, waiting for us. Nearly a third of
+the frame was page faults, and they turned out to be `amdgpu` faults on a *GPU buffer mapping*:
+every texture upload mapped its staging buffer, memcpy'd 33 MB into it, and unmapped, so all 8192
+pages faulted back in on the next frame. Keeping the mapping alive halves the per-frame texture
+binding cost, 1082 ms to 520 ms, and lifts the frame rate about 6%. Two wrong hypotheses died on
+the way, both recorded in [#3405](https://github.com/mattias800/prosper/issues/3405).
+
+
 ### We can now ask a black pixel why it is black, and get an answer
 
 Four causes produce an identical black pixel — nothing drew there, something drew and was rejected,

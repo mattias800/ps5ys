@@ -2462,6 +2462,144 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
     return memory;
 }
 
+// #3405: texture staging blocks cached together WITH their CPU mapping.
+//
+// The render-memory pool already avoids vkAllocateMemory, but every consumer still wrapped each
+// use in vkMapMemory/vkUnmapMemory. Dropping the mapping returns the pages, so the next write
+// faults all of them back in through amdgpu -- ~30% of the profile (amdgpu_gem_fault,
+// ttm_bo_vm_fault_reserved, vmf_insert_pfn_prot, pfnmap_setup_cachemode) while memcpy'ing a
+// 33 MB 4K staging texture. Keeping the mapping alive measured +12% guest flips/s.
+//
+// These blocks are deliberately NOT drawn from the shared pool: a retained mapping on shared
+// memory is unsound, because the block returns to the pool and the next consumer issues its own
+// vkMapMemory on an already-mapped allocation.
+//
+// `owned` is the load-bearing part. The cache must be the ONLY code that can free a block it
+// created: a caller that releases the same staging twice would otherwise fall through to the
+// generic teardown, vkFreeMemory the allocation this cache still maps, and leave a dangling
+// mapped pointer for the next acquire to memcpy into.
+struct MappedStagingBlock {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDevice device = VK_NULL_HANDLE;   // #3405: a cached handle is only valid for ITS device
+};
+
+struct MappedStagingCache {
+    std::mutex mutex;
+    // Keyed by device as well as shape: VkBuffer/VkDeviceMemory belong to the VkDevice that
+    // created them, and a process that builds more than one device would otherwise be handed a
+    // block from a destroyed one.
+    std::map<std::tuple<VkDevice, VkDeviceSize, uint32_t>,
+             std::vector<MappedStagingBlock>> free_blocks;
+    std::unordered_map<VkDeviceMemory, std::tuple<VkDevice, VkDeviceSize, uint32_t>> in_use;
+    std::unordered_map<VkDeviceMemory, std::tuple<VkDevice, VkDeviceSize, uint32_t>> owned;
+    uint64_t cross_device_skips = 0;
+    VkDeviceSize cached_bytes = 0;
+    uint64_t double_releases = 0;
+};
+
+inline MappedStagingCache& mapped_staging_cache() {
+    static MappedStagingCache cache;
+    return cache;
+}
+
+template <typename PickMemoryType>
+inline MappedStagingBlock acquire_mapped_staging(VkDevice device, VkDeviceSize bytes,
+                                                 VkBufferUsageFlags usage,
+                                                 PickMemoryType&& pick) {
+    if (!bytes) return {};
+    MappedStagingCache& cache = mapped_staging_cache();
+    const std::tuple<VkDevice, VkDeviceSize, uint32_t> key{device, bytes,
+                                                           static_cast<uint32_t>(usage)};
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        auto found = cache.free_blocks.find(key);
+        if (found != cache.free_blocks.end() && !found->second.empty()) {
+            MappedStagingBlock block = found->second.back();
+            found->second.pop_back();
+            if (found->second.empty()) cache.free_blocks.erase(found);
+            cache.cached_bytes -= bytes;
+            cache.in_use.emplace(block.memory, key);
+            return block;                  // mapping intact: no fault-in on the next write
+        }
+    }
+
+    MappedStagingBlock block;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = usage;
+    if (vkCreateBuffer(device, &bci, nullptr, &block.buffer) != VK_SUCCESS) return {};
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device, block.buffer, &requirements);
+    const uint32_t type = pick(requirements.memoryTypeBits);
+    if (type == UINT32_MAX) { vkDestroyBuffer(device, block.buffer, nullptr); return {}; }
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = type;
+    if (vkAllocateMemory(device, &allocation, nullptr, &block.memory) != VK_SUCCESS) {
+        vkDestroyBuffer(device, block.buffer, nullptr);
+        return {};
+    }
+    vkBindBufferMemory(device, block.buffer, block.memory, 0);
+    if (vkMapMemory(device, block.memory, 0, VK_WHOLE_SIZE, 0, &block.mapped) != VK_SUCCESS ||
+        !block.mapped) {
+        vkFreeMemory(device, block.memory, nullptr);
+        vkDestroyBuffer(device, block.buffer, nullptr);
+        return {};
+    }
+    block.device = device;
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.in_use.emplace(block.memory, key);
+    cache.owned.emplace(block.memory, key);
+    return block;
+}
+
+// True means "this cache owns the allocation; the caller must not free it". That answer is given
+// for a block already back in the free list too, so a duplicate release is a no-op rather than a
+// dangling mapping.
+inline bool release_mapped_staging(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
+                                   void* mapped) {
+    if (!memory) return false;
+    MappedStagingCache& cache = mapped_staging_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (!cache.owned.count(memory)) return false;          // not ours: caller tears it down
+    // Bisection seam: with this set the block is destroyed rather than retained, so acquire is
+    // exercised exactly as before but nothing is ever reused. It separates "the new allocation
+    // path is wrong" from "reusing a block is wrong".
+    static const bool no_reuse = getenv("PROSPER_NO_MAPPED_STAGING") != nullptr;
+    if (no_reuse) {
+        cache.owned.erase(memory);
+        cache.in_use.erase(memory);
+        vkUnmapMemory(device, memory);
+        vkFreeMemory(device, memory, nullptr);
+        vkDestroyBuffer(device, buffer, nullptr);
+        return true;
+    }
+    auto active = cache.in_use.find(memory);
+    if (active == cache.in_use.end()) { ++cache.double_releases; return true; }
+    const std::tuple<VkDevice, VkDeviceSize, uint32_t> key = active->second;
+    const VkDeviceSize key_bytes = std::get<1>(key);
+    cache.in_use.erase(active);
+    if (std::get<0>(key) != device) {
+        // The allocation belongs to a different device than the one tearing it down. Do not
+        // retain it and do not touch it with this device; just forget it.
+        ++cache.cross_device_skips;
+        cache.owned.erase(memory);
+        return false;
+    }
+    if (cache.cached_bytes + key_bytes > render_memory_pool_limit()) {
+        cache.owned.erase(memory);
+        vkUnmapMemory(device, memory);
+        vkFreeMemory(device, memory, nullptr);
+        vkDestroyBuffer(device, buffer, nullptr);
+        return true;
+    }
+    cache.free_blocks[key].push_back(MappedStagingBlock{buffer, memory, mapped, device});
+    cache.cached_bytes += key_bytes;
+    return true;
+}
+
 inline void release_transient_render_memory(VkDevice device, VkDeviceMemory memory) {
     if (!memory) return;
     if (!render_memory_pool_enabled()) {
@@ -6136,6 +6274,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+        void* staging_mapped = nullptr;   // #3405: retained with the block, never unmapped here
         uint64_t persistent_id = 0;
         uint64_t persistent_version = 0;
         VkDeviceSize image_bytes = 0;
@@ -7743,20 +7882,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                     (r.is_storage_image
                                          ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
-                                vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
-                                VkMemoryRequirements sr;
-                                vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
-                                VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                                sai.allocationSize = sr.size;
-                                sai.memoryTypeIndex = pick(sr.memoryTypeBits,
-                                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                                upload.staging_memory = allocate_transient_render_memory(
-                                    dev, sai.allocationSize, sai.memoryTypeIndex);
-                                vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
-                                void* sp = nullptr;
-                                vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
-                                if (r.tex_rgba) {
+                                // #3405: buffer + memory + mapping arrive together, so the copy
+                                // below writes into pages that are already resident.
+                                const MappedStagingBlock staged = acquire_mapped_staging(
+                                    dev, tbytes, stci.usage, [&](uint32_t bits) {
+                                        return pick(bits,
+                                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                    });
+                                upload.staging = staged.buffer;
+                                upload.staging_memory = staged.memory;
+                                upload.staging_mapped = staged.mapped;
+                                void* sp = staged.mapped;
+                                if (!sp) {
+                                    // Never memcpy into a failed mapping. The old code ignored
+                                    // vkMapMemory's status and would have written to nullptr.
+                                    fprintf(stderr, "[stage] staging map failed for %ux%u (%llu "
+                                            "bytes); skipping this upload\n", r.tw, r.th,
+                                            (unsigned long long)tbytes);
+                                } else if (r.tex_rgba) {
                                     std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
                                 } else {
                                     // Only a declined/missed depth-plane borrow reaches the creation
@@ -7774,7 +7918,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                 (unsigned long long)r.persistent_depth_target_id,
                                                 r.tw, r.th);
                                 }
-                                vkUnmapMemory(dev, upload.staging_memory);
                             }
                         }
                     }
@@ -10211,16 +10354,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             const size_t storage_bytes = static_cast<size_t>(upload.key.width) *
                 upload.key.height * upload.key.depth * upload.key.sample_count *
                 backend_color_bytes_per_pixel(upload.key.format);
-            void* mapped = nullptr;
-            if (!storage_bytes ||
-                vkMapMemory(dev, upload.staging_memory, 0, storage_bytes, 0,
-                            &mapped) != VK_SUCCESS ||
-                !mapped)
+            // #3405: this staging block is already mapped for its whole life. Re-mapping it
+            // fails with VK_ERROR_MEMORY_MAP_FAILED, and the vkUnmapMemory that used to follow
+            // would tear down the retained mapping and leave the cached pointer dangling for
+            // the next reuse -- which is precisely how the first attempt at this change
+            // segfaulted texture_sample_render. Read through the retained pointer instead, and
+            // only map (and unmap) when the block is not one of ours.
+            void* mapped = upload.staging_mapped;
+            const bool borrowed_mapping = mapped != nullptr;
+            if (!storage_bytes) continue;
+            if (!borrowed_mapping &&
+                (vkMapMemory(dev, upload.staging_memory, 0, storage_bytes, 0,
+                             &mapped) != VK_SUCCESS ||
+                 !mapped))
                 continue;
             const auto* pixels = static_cast<const uint8_t*>(mapped);
             for (const auto& writeback : upload.storage_writebacks)
                 writeback(pixels, storage_bytes);
-            vkUnmapMemory(dev, upload.staging_memory);
+            if (!borrowed_mapping) vkUnmapMemory(dev, upload.staging_memory);
         }
     }
     if (readback_requested && batch_completed) {
@@ -10463,9 +10614,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
                     else release_transient_render_memory(dev, upload.memory);
                 }
-                if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
-                if (upload.staging_memory)
-                    release_transient_render_memory(dev, upload.staging_memory);
+                // #3405: the cache owns its blocks and answers true even for a duplicate
+                // release, so the generic teardown can never free an allocation it still maps.
+                if (!release_mapped_staging(dev, upload.staging, upload.staging_memory,
+                                            upload.staging_mapped)) {
+                    if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
+                    if (upload.staging_memory)
+                        release_transient_render_memory(dev, upload.staging_memory);
+                }
             }
             if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
             if (seedmem) release_transient_render_memory(dev, seedmem);
