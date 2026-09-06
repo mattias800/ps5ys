@@ -17,6 +17,7 @@
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
+#include "shared/rtt/rtt_authority.hpp"   // #3407: the shared MUTABLE_FORMAT switch
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/perf/performance_timing_gate.hpp"
@@ -1420,6 +1421,16 @@ inline const RenderVkCtx& render_vk_ctx() {
                               "[vk] VK_EXT_descriptor_indexing lacks "
                               "shaderStorageBufferArrayNonUniformIndexing\n");
                   }
+              }
+              // #3407: lets a colour target created MUTABLE_FORMAT declare the exact formats it
+              // will ever be viewed as, so the driver can keep DCC instead of conservatively
+              // dropping compression for an unknown future view. Core in Vulkan 1.2; this backend
+              // requests a 1.1 instance (see vkCreateInstance above), so it is taken as a device
+              // extension when present. Absence is not a failure -- the flag is still set and the
+              // driver simply makes the pessimistic choice.
+              if (!strcmp(de[i].extensionName, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) {
+                  dev_exts.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+                  prosper::frontend::rtt_image_format_list_available() = true;
               }
               if (!strcmp(de[i].extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -3121,9 +3132,25 @@ inline bool consume_render_color_target_create_failure(RenderColorTargetCreateSi
 // handle guard stays correct whatever the driver left behind.
 inline VkResult create_color_target_image(VkDevice dev, const VkImageCreateInfo& ci,
                                           RenderColorTargetCreateSite site, VkImage* out_image) {
+    VkImageCreateInfo mutable_ci = ci;
+    static constexpr VkFormat kRgba8ViewFormats[] = {VK_FORMAT_R8G8B8A8_UNORM,
+                                                     VK_FORMAT_R8G8B8A8_UINT};
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    if (prosper::frontend::rtt_mutable_format_enabled() && ci.format == VK_FORMAT_R8G8B8A8_UNORM) {
+        mutable_ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        // Naming the complete view-format set is what lets the driver keep compression: without it
+        // MUTABLE_FORMAT means "any compatible format", and a conservative driver drops DCC. With
+        // it the promise is exactly these two, which are the same bytes.
+        if (prosper::frontend::rtt_image_format_list_available()) {
+            format_list.viewFormatCount = 2;
+            format_list.pViewFormats = kRgba8ViewFormats;
+            format_list.pNext = mutable_ci.pNext;
+            mutable_ci.pNext = &format_list;
+        }
+    }
     const VkResult result = consume_render_color_target_create_failure(site)
         ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-        : vkCreateImage(dev, &ci, nullptr, out_image);
+        : vkCreateImage(dev, &mutable_ci, nullptr, out_image);
     if (result == VK_SUCCESS && *out_image) return VK_SUCCESS;
     *out_image = VK_NULL_HANDLE;
     static std::atomic<uint32_t> color_target_create_failure_logs{0};

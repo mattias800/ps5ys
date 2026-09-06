@@ -293,7 +293,21 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
     const bool equivalent_unorm_values = float_sampled_values && components == 4 &&
         format == DataFormat::Unorm16 &&
         target_format == LiveTargetPixelFormat::Rgba8Unorm;
-    return exact || equivalent_unorm_values;
+    // #3407: RGBA8_UINT over the renderer's RGBA8_UNORM image. These are the SAME BYTES -- a
+    // same-width Vulkan format-compatible pair, and the identical argument this file already makes
+    // at the storage-image create below, which sets VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT for exactly
+    // this UNORM/UINT class. Admitting it here is what lets a dispatch bind the renderer's image in
+    // place instead of round-tripping 33 MB through the CPU to reinterpret bytes that never moved.
+    //
+    // Gated on the SAME switch that decides whether the renderer created its targets mutable. The
+    // two must never disagree: admitting the pair over a non-mutable image would ask Vulkan for an
+    // illegal view. `prosper::frontend::rtt_mutable_format_enabled()` is the single reader of
+    // PROSPER_NO_RTT_MUTABLE_FORMAT, so there is one switch and not two.
+    const bool uint8_over_unorm8 = components == 4 &&
+        format == DataFormat::Uint8 &&
+        target_format == LiveTargetPixelFormat::Rgba8Unorm &&
+        prosper::frontend::rtt_mutable_format_enabled();
+    return exact || equivalent_unorm_values || uint8_over_unorm8;
 }
 
 bool sampled_rtt_snapshot_byte_compatible(

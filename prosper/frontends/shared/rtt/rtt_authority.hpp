@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 namespace prosper::frontend {
@@ -11,6 +12,32 @@ namespace prosper::frontend {
 // is a mirror produced by an ordered readback (or the matching CPU result of the same render pass),
 // so sampling the image remains safe. Guest writes erase the cache entry and CPU-only publications
 // explicitly clear gpu_valid before an importer can observe them.
+// #3407. A compute descriptor may sample a renderer colour target as RGBA8_UINT while the renderer
+// created it RGBA8_UNORM -- the same eight bits per channel, differently interpreted. Binding the
+// renderer's image in place then needs VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT on that image, and the
+// fallback when it is absent is a full GPU->CPU readback, a single-threaded reinterpretation and a
+// re-upload of bytes that never needed to move.
+//
+// TWO call sites must agree and they live in different translation units: the renderer decides
+// whether to create its colour targets mutable (`create_color_target_image`), and compute decides
+// whether to request such a view (`direct_sampled_rtt_compatible`). Admitting the pair over an
+// image that was not created to allow it would ask Vulkan for an illegal view, so this is
+// deliberately ONE reader in a header both already depend on rather than two `getenv` calls that
+// can drift apart.
+inline bool rtt_mutable_format_enabled() {
+    static const bool enabled = std::getenv("PROSPER_NO_RTT_MUTABLE_FORMAT") == nullptr;
+    return enabled;
+}
+
+// Set during device creation when VK_KHR_image_format_list was enabled (core in Vulkan 1.2; this
+// backend requests a 1.1 instance, so it is taken as a device extension when present). Naming the
+// complete view-format set lets a driver keep DCC on a mutable image instead of conservatively
+// dropping compression for an unknown future view.
+inline bool& rtt_image_format_list_available() {
+    static bool available = false;
+    return available;
+}
+
 enum class LiveRttAuthority { none, cpu, gpu, mirrored };
 
 constexpr LiveRttAuthority live_rtt_authority(bool gpu_valid, bool has_cpu_snapshot) {
