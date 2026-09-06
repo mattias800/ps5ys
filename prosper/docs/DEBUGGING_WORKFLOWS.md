@@ -72,8 +72,11 @@ was submitted", which is a different question from "what happened here", and inf
 from the first is what has produced retracted issues in this project:
 
 ```bash
-renderdoccmd capture -w build-linux/prosper-app --dump "$dump_dir"   # or attach to a live run
-python3 tools/pixel_history/pixel_history.py "$run_dir/frame.rdc" --output "$run_dir/pixhist"
+# -c is not optional in practice: without it renderdoccmd writes the .rdc under /tmp, which
+# on this box is the RAM-backed tmpfs a capture must never touch. Frame number is appended.
+renderdoccmd capture -c "$run_dir/frame" -w build-linux/prosper-app --dump "$dump_dir"
+python3 tools/pixel_history/pixel_history.py "$run_dir"/frame_frame*.rdc \
+    --output "$run_dir/pixhist"
 ```
 
 It reports one of `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`

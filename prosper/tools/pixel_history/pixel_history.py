@@ -34,22 +34,39 @@ import traceback
 # known-answer control, where a scissored white draw reported the earlier draw's blue.
 # Reporting that as "the shader computed blue" would be a confident lie, so these
 # events carry no shader output at all.
+# Rejections RenderDoc's Vulkan pixel history evaluates and returns on BEFORE running the
+# fragment shader (vk_pixelhistory.cpp: scissor at :4470, sample mask at :4478, each
+# `return`ing immediately). shaderOut is still populated for these and carries the previous
+# event's residue -- see instrument trap 268.
 PRE_FRAGMENT = ("scissorClipped", "backfaceCulled", "depthClipped", "viewClipped",
                 "predicationSkipped", "sampleMasked")
-REJECTIONS = PRE_FRAGMENT + ("depthTestFailed", "stencilTestFailed", "shaderDiscarded",
-                             "depthBoundsFailed", "unboundPS")
+# Rejections that normally happen AFTER the shader, so their shaderOut is real and is often
+# the whole answer. The exception is a shader declaring EarlyFragmentTests, where RenderDoc
+# evaluates these first (vk_pixelhistory.cpp:4525) and the output is residue again. The
+# Python API exposes no per-event early-fragment flag, so these are reported with a caveat
+# rather than suppressed -- and no verdict is ever derived from a rejected event's output.
+POST_FRAGMENT = ("depthTestFailed", "stencilTestFailed", "depthBoundsFailed")
+# Not a rejection at all: Passed() excludes unboundPS (data_types.h:2759), so such an event
+# arrives passed=True while its own documentation says the output "may have undefined
+# values" (:2664). Trusting it is trap 268 one list entry over, so it is called out by name
+# and its output is never used.
+UNDEFINED_OUTPUT = ("unboundPS",)
+REJECTIONS = PRE_FRAGMENT + POST_FRAGMENT + ("shaderDiscarded",) + UNDEFINED_OUTPUT
+# Vulkan-only note: predicationSkipped is set only by the D3D11 backend, and on D3D11/12 the
+# sample mask is the output-merger mask applied AFTER the shader. This tool reads prosper's
+# Vulkan captures; a D3D11 capture would need sampleMasked moved out of PRE_FRAGMENT.
 BLACK = 1.0 / 255.0
 
 
 def suppress_shader_output(rejected_by):
-    """Did this event's fragment shader never run? Then its shaderOut is another draw's.
+    """Is this event's shaderOut another draw's residue, or undefined?
 
     Extracted from the replay path deliberately: that path needs RenderDoc and a GPU, so
     nothing in CI can reach it. Leaving the decision inline meant deleting PRE_FRAGMENT
     left every test green while the tool began reporting a neighbouring draw's colour as
     this draw's shader output -- measured, not hypothetical.
     """
-    return any(f in PRE_FRAGMENT for f in rejected_by)
+    return any(f in PRE_FRAGMENT or f in UNDEFINED_OUTPUT for f in rejected_by)
 
 
 def classify(events):
@@ -64,17 +81,27 @@ def classify(events):
                 why[r] = why.get(r, 0) + 1
         named = ", ".join(f"{k}x{v}" for k, v in sorted(why.items(), key=lambda kv: -kv[1]))
         return "ALL_REJECTED", f"{len(events)} events reached the pixel, none survived: {named or 'no reason flagged'}."
-    final = passed[-1]["postMod"]
-    lit = max(final[:3]) if final else 0.0
+
+    # Only the LAST passing event can explain the pixel's final state. An earlier bright
+    # writer that was legitimately overdrawn -- a white sky behind a black object -- is not
+    # evidence of a lost store, and reading it as one made SHADER_WROTE_BLACK unreachable
+    # on any pixel with history, which is most of a real frame.
+    final = passed[-1]
+    lit = max(final["postMod"][:3]) if final["postMod"] else 0.0
     if lit > BLACK:
         return "PIXEL_WAS_WRITTEN", f"{len(passed)} of {len(events)} events passed; final colour is not black."
-    bright = [e for e in passed if e["shaderOut"] and max(e["shaderOut"][:3]) > BLACK]
-    if bright:
+    if final["shader_output_suppressed"]:
+        named = ", ".join(final["rejected_by"]) or "unknown"
+        return "OUTPUT_UNTRUSTED", (
+            f"the last passing event ({named}) has no trustworthy shader output, so "
+            f"'computed black' and 'store lost it' cannot be separated here -- pick "
+            f"another pixel, or inspect that event directly.")
+    if final["shaderOut"] and max(final["shaderOut"][:3]) > BLACK:
         return "STORE_LOST_IT", (
-            f"{len(bright)} passing event(s) computed a non-black colour and the target is "
-            f"black anyway -- blend state, write mask, or later overdraw.")
+            "the last passing event computed a non-black colour and the target is black "
+            "anyway -- blend state, write mask, or a later event that is not in this list.")
     return "SHADER_WROTE_BLACK", (
-        f"{len(passed)} event(s) passed every test and the shader computed black -- "
+        f"{len(passed)} event(s) passed every test and the last one computed black -- "
         f"resource binding, textures, uniforms or the shader itself.")
 
 
@@ -119,11 +146,25 @@ def embedded():
             raise RuntimeError("no draw actions in capture")
         ctl.SetFrameEvent(actions[-1].eventId, True)
 
-        targets = [t for t in ctl.GetTextures()
-                   if t.creationFlags & rd.TextureCategory.ColorTarget]
+        # Prefer the targets actually BOUND at the selected event. TextureCategory.ColorTarget
+        # is set for VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT as well as COLOR_ATTACHMENT
+        # (vk_info.cpp:2601-2603), so scanning every texture can hand back a transient
+        # attachment nothing presents -- and its empty history reads as NOTHING_DREW.
+        by_id = {t.resourceId: t for t in ctl.GetTextures()}
+        bound = [by_id[o.resource] for o in ctl.GetPipelineState().GetOutputTargets()
+                 if o.resource != rd.ResourceId.Null() and o.resource in by_id]
+        source, targets = "bound output targets at the last draw", bound
+        if not targets:
+            targets = [t for t in ctl.GetTextures()
+                       if t.creationFlags & rd.TextureCategory.ColorTarget]
+            source = "texture scan (no bound output target; may include transient attachments)"
         if not targets:
             raise RuntimeError("no colour targets in capture")
-        tex = targets[min(req["target"], len(targets) - 1)]
+        if not 0 <= req["target"] < len(targets):
+            raise RuntimeError(
+                f"--target {req['target']} out of range: {len(targets)} target(s) available "
+                f"from {source}. Silently clamping would analyse a different image than asked.")
+        tex = targets[req["target"]]
 
         # Save the target first: selection needs to see the image, and the image is also
         # the evidence a reader wants beside the verdict.
@@ -158,6 +199,10 @@ def embedded():
                 except Exception as exc:
                     how = f"centre (content guidance unavailable: {exc})"
 
+        if not (0 <= pixel[0] < tex.width and 0 <= pixel[1] < tex.height):
+            raise RuntimeError(
+                f"pixel {tuple(pixel)} is outside the {tex.width}x{tex.height} target; an "
+                f"out-of-bounds history is empty and would read as NOTHING_DREW")
         hist = ctl.PixelHistory(tex.resourceId, pixel[0], pixel[1],
                                 rd.Subresource(0, 0, 0), rd.CompType.Typeless)
         events = []
@@ -175,10 +220,29 @@ def embedded():
                 "postMod": values(m.postMod),
             })
         verdict, reason = classify(events)
+
+        control = {}
+        if req.get("expect_control"):
+            for name, (cx, cy), _ in CONTROL_REGIONS:
+                ch = ctl.PixelHistory(tex.resourceId, cx, cy, rd.Subresource(0, 0, 0),
+                                      rd.CompType.Typeless)
+                ce = []
+                for m in ch:
+                    rej = [f for f in REJECTIONS if getattr(m, f, False)]
+                    pre = suppress_shader_output(rej)
+                    ce.append({"eventId": int(m.eventId), "passed": bool(m.Passed()),
+                               "rejected_by": rej,
+                               "shaderOut": None if pre else values(m.shaderOut),
+                               "shader_output_suppressed": pre,
+                               "postMod": values(m.postMod)})
+                control[name] = {"verdict": classify(ce)[0], "events": ce}
+
         result = {"status": "REPLAYED", "verdict": verdict, "reason": reason,
+                  "control_regions": control,
                   "pixel": list(pixel), "pixel_choice": how,
                   "target": {"id": str(tex.resourceId), "width": tex.width,
-                             "height": tex.height},
+                             "height": tex.height, "chosen_from": source,
+                             "candidates": len(targets)},
                   "target_image": image, "draw_count": len(actions),
                   "events": events,
                   "api": {"pixelHistory": bool(props.pixelHistory),
@@ -190,24 +254,47 @@ def embedded():
     os._exit(0 if result["status"] == "REPLAYED" else 1)
 
 
-CONTROL_EXPECTED = [
-    ("passed", []), ("passed", []), ("rejected", ["depthTestFailed"]),
-    ("rejected", ["scissorClipped"]), ("rejected", ["shaderDiscarded"]), ("passed", []),
+# The control's five regions, restated here independently of the C source that builds them.
+# Each exists to construct ONE verdict: a control that only ever produces one tests the
+# machinery and not the distinctions the tool is for.
+CONTROL_REGIONS = [
+    ("A  sequence", (16, 16), "PIXEL_WAS_WRITTEN"),
+    ("A' arm-1 only", (16, 36), "PIXEL_WAS_WRITTEN"),
+    ("B  black draw", (48, 16), "SHADER_WROTE_BLACK"),
+    ("C  no write", (16, 48), "STORE_LOST_IT"),
+    ("E  all killed", (48, 48), "ALL_REJECTED"),
 ]
 
 
-def check_control(events):
-    """The control's construction, restated independently of the C source that built it."""
-    got = [("passed" if e["passed"] else "rejected", e["rejected_by"]) for e in events]
-    if got != CONTROL_EXPECTED:
-        return [f"control mismatch: expected {CONTROL_EXPECTED}, read {got}"]
+def check_control(regions):
+    """Check a full control reading: every verdict, and the suppression trap 268 needs.
+
+    `regions` maps region name -> {"verdict": str, "events": [...]}.
+    """
     problems = []
-    if events[3]["shaderOut"] is not None:
-        problems.append("scissored event still reported a shader output; the stale-value "
-                        "suppression is not working")
-    final = events[-1]["postMod"][:3]
-    if not (final[0] > 0.9 and final[1] > 0.9 and final[2] < 0.1):
-        problems.append(f"final colour {final} is not the constructed yellow")
+    for name, _, want in CONTROL_REGIONS:
+        got = regions.get(name)
+        if got is None:
+            problems.append(f"{name}: region missing from the reading")
+        elif got["verdict"] != want:
+            problems.append(f"{name}: expected {want}, read {got['verdict']}")
+
+    seq = regions.get("A  sequence")
+    if seq:
+        reasons = [r for e in seq["events"] for r in e["rejected_by"]]
+        for needed in ("depthTestFailed", "shaderDiscarded", "scissorClipped"):
+            if needed not in reasons:
+                problems.append(f"A: {needed} was constructed but not reported; a rejection "
+                                f"is being misattributed")
+        # Trap 268: the scissored arm's shaderOut is the PREVIOUS draw's colour. If any
+        # positionally-rejected event still carries an output, the suppression is off and the
+        # tool is one step from reporting a neighbouring draw's colour as this one's.
+        leaked = [e["eventId"] for e in seq["events"]
+                  if suppress_shader_output(e["rejected_by"]) and e["shaderOut"] is not None]
+        if leaked:
+            problems.append(f"A: events {leaked} were rejected before the fragment shader ran "
+                            f"and still reported a shader output; the stale-value suppression "
+                            f"is not working")
     return problems
 
 
@@ -239,7 +326,8 @@ def main():
         parser.error(f"output must be a new directory: {exc}")
 
     request = {"capture": str(args.capture.resolve()), "output": str(output),
-               "pixel": pixel, "target": args.target}
+               "pixel": pixel, "target": args.target,
+               "expect_control": args.expect_control}
     request_path = output / "request.json"
     request_path.write_text(json.dumps(request, indent=2) + "\n")
     env = {**os.environ, "PROSPER_PIXHIST_REQUEST": str(request_path),
@@ -263,22 +351,34 @@ def main():
         return 1
 
     if args.expect_control:
-        problems = check_control(data["events"])
-        for p in problems:
-            print(f"CONTROL FAILED: {p}", file=sys.stderr)
+        regions = data.get("control_regions") or {}
+        problems = check_control(regions)
+        for name, _, _ in CONTROL_REGIONS:
+            got = regions.get(name)
+            print(f"  {name:<16} {got['verdict'] if got else 'MISSING'}")
+        for problem in problems:
+            print(f"CONTROL FAILED: {problem}", file=sys.stderr)
         if problems:
             return 1
-        print("CONTROL VERIFIED: every constructed outcome was read back correctly.")
+        print(f"CONTROL VERIFIED: {len(CONTROL_REGIONS)} regions, every constructed verdict "
+              f"and rejection reason read back correctly.")
 
     print(f"{data['verdict']}: {data['reason']}")
     print(f"  pixel {tuple(data['pixel'])} of {data['target']['width']}x"
           f"{data['target']['height']}, chosen by {data['pixel_choice']}")
+    print(f"  target {data['target']['id']} of {data['target']['candidates']}, "
+          f"from {data['target']['chosen_from']}")
     print(f"  {data['draw_count']} draws in frame, {len(data['events'])} touched this pixel")
     for e in data["events"]:
         out = ("suppressed (no fragment ran)" if e["shader_output_suppressed"]
                else ("[" + ", ".join(f"{v:.3f}" for v in e["shaderOut"]) + "]"
                      if e["shaderOut"] else "-"))
-        state = "PASS" if e["passed"] else ",".join(e["rejected_by"]) or "rejected"
+        # Passed() ignores unboundPS, so an event with no bound pixel shader arrives as a
+        # pass. Printing a bare "PASS" would hide the one fact that matters about it.
+        undefined = [f for f in e["rejected_by"] if f in UNDEFINED_OUTPUT]
+        state = (("PASS!" + ",".join(undefined)) if e["passed"] and undefined
+                 else "PASS" if e["passed"]
+                 else ",".join(e["rejected_by"]) or "rejected")
         print(f"    eid {e['eventId']:>6}  {state:<20} shaderOut {out}")
     print(f"  evidence: {args.output}")
     return 0

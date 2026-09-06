@@ -8,24 +8,44 @@
  * that -- the game is the unknown. So this program constructs each case BY HAND, at a
  * named pixel, and the tool's report is checked against what was built.
  *
- * THE CONSTRUCTION. One 64x64 target, cleared to RED, then five full-screen draws that
- * differ in exactly ONE property each. At the probe pixel (32,32):
+ * THE CONSTRUCTION. One 64x64 target, transfer-cleared to BLACK before the render pass
+ * (a transfer clear, deliberately, so it is not itself a pixel-history event), then draws
+ * confined by scissor to five regions. Each region probes a DIFFERENT verdict, because a
+ * control that only ever produces one of them tests the machinery and not the distinctions:
  *
- *   draw 1  green   depth 0.5  full scissor        -> PASSES, pixel becomes green
- *   draw 2  blue    depth 0.9  full scissor        -> DEPTH TEST FAILS (0.9 >= 0.5)
- *   draw 3  white   depth 0.1  scissor {0,0,4,4}   -> SCISSORED OUT (0.1 would have won)
- *   draw 4  magenta depth 0.1  full scissor, kill  -> SHADER DISCARDS
- *   draw 5  yellow  depth 0.2  full scissor        -> PASSES, pixel becomes yellow
+ *   A  (16,16)  five arms, below           -> PIXEL_WAS_WRITTEN, final YELLOW
+ *   A' (16,36)  arm 1 only draws here      -> final GREEN; this is what proves arm 1 ran
+ *   B  (48,16)  one passing draw, black    -> SHADER_WROTE_BLACK
+ *   C  (16,48)  one passing draw, bright,
+ *               through a colorWriteMask=0
+ *               pipeline                   -> STORE_LOST_IT, final BLACK
+ *   E  (48,48)  two draws, both discard    -> ALL_REJECTED
  *
- * Draw 3 is deliberately the draw that WOULD have won on depth. If the scissor were not
- * applied it would write white and leave depth at 0.1, and draw 5 would then fail -- so
- * the final colour discriminates "scissor worked" from "scissor ignored" without needing
- * the tool at all. Draw 4 discards a fragment that would otherwise have passed, so
- * "discarded" cannot be confused with "never reached".
+ * Region A's arms, in submission order, at (16,16):
  *
- * SELF-CHECK. The program reads the pixel back and asserts yellow BEFORE any tool looks
- * at the capture. A control that is itself broken must fail here rather than silently
- * become the thing the tool is validated against.
+ *   1 green   depth 0.5  wide scissor  -> PASSES  (also paints A', which is how it is seen)
+ *   2 white   depth 0.1  tiny scissor  -> SCISSORED OUT (0.1 would have won)
+ *   3 magenta depth 0.1  kill          -> SHADER DISCARDS
+ *   4 yellow  depth 0.2                -> PASSES, pixel becomes yellow
+ *   5 blue    depth 0.9                -> DEPTH TEST FAILS, and it is LAST on purpose
+ *
+ * Arm 5 is last so that a broken depth test is visible in the final colour: if it wrongly
+ * passed, the pixel would end blue. In the first version of this control the depth-fail arm
+ * ran second, and a broken depth test was invisible -- the later lower-depth arm overwrote
+ * it either way. Arm 2 is the draw that would otherwise have won on depth, so an ignored
+ * scissor ends the pixel white; arm 3 discards a fragment that would otherwise have passed,
+ * so "discarded" cannot be confused with "never reached".
+ *
+ * WHAT THE SELF-CHECK ESTABLISHES, AND WHAT IT DOES NOT. Reading five pixels back proves
+ * the construction reached the intended FINAL STATE in every region. It does not prove each
+ * arm was rejected for the intended REASON -- a scissor and a discard both leave the pixel
+ * untouched. That is the tool's job: `pixel_history.py --expect-control` compares the whole
+ * per-event outcome list, and it is the check that fails if a rejection is misattributed.
+ * Do not read a green self-check as validating the tool.
+ *
+ * NOTHING_DREW is not constructed here. Every scissored draw still produces a pixel-history
+ * entry at pixels outside its rectangle, so no pixel of this target has an empty history.
+ * That verdict is exercised separately, against a capture whose geometry misses the pixel.
  *
  * Usage: pixel_history_control                 (self-check only, no capture)
  *        pixel_history_control <path template> (built with PROSPER_PIXHIST_CAPTURE)
@@ -90,8 +110,16 @@ struct push {
 struct arm {
     const char *name;
     struct push pc;
-    int         narrow_scissor;
+    VkRect2D    scissor;
+    int         no_color_write;   /* selects the colorWriteMask=0 pipeline */
     const char *expect;
+};
+
+struct probe {
+    const char   *region;
+    uint32_t      x, y;
+    unsigned char want[4];
+    const char   *verdict;
 };
 
 #ifdef PROSPER_PIXHIST_CAPTURE
@@ -143,9 +171,6 @@ int main(void)
     r = vkCreateDevice(g_pd, &dci, NULL, &g_dev);
     if (r) die("vkCreateDevice", r);
     vkGetDeviceQueue(g_dev, g_queue_family, 0, &g_queue);
-#ifdef PROSPER_PIXHIST_CAPTURE
-    capture_begin(argv[1]);
-#endif
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g_pd, &props);
@@ -208,15 +233,20 @@ int main(void)
     VkAttachmentDescription att[2] = {{0}, {0}};
     att[0].format = VK_FORMAT_R8G8B8A8_UNORM;
     att[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    /* LOAD, not CLEAR: a render-pass clear is itself a pixel-history event that passes at
+     * every pixel, which would make ALL_REJECTED unconstructible. The black ground comes
+     * from a transfer clear before the pass instead. */
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     att[1] = att[0];
     att[1].format = VK_FORMAT_D32_SFLOAT;
+    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;    /* depth still starts at 1.0 */
     att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkAttachmentReference cref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -318,6 +348,18 @@ int main(void)
     r = vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipeline);
     if (r) die("vkCreateGraphicsPipelines", r);
 
+    /* Identical but for the write mask. A draw through this passes every test and computes a
+     * colour the target never receives -- which is exactly STORE_LOST_IT, and is the verdict
+     * the first version of this control could not construct at all. */
+    VkPipelineColorBlendAttachmentState cba0 = cba;
+    cba0.colorWriteMask = 0;
+    VkPipelineColorBlendStateCreateInfo cb0 = cb;
+    cb0.pAttachments = &cba0;
+    gpi.pColorBlendState = &cb0;
+    VkPipeline pipeline_no_write;
+    r = vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipeline_no_write);
+    if (r) die("vkCreateGraphicsPipelines(no-write)", r);
+
     /* ---- readback buffer ------------------------------------------------------------ */
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = (VkDeviceSize)DIM * DIM * 4;
@@ -336,13 +378,32 @@ int main(void)
     if (r) die("vkAllocateMemory(readback)", r);
     vkBindBufferMemory(g_dev, readback, readback_mem, 0);
 
-    /* ---- the five arms -------------------------------------------------------------- */
-    const struct arm arms[5] = {
-        {"green  depth 0.5",       {{0,1,0,1}, 0.5f, 0}, 0, "PASS"},
-        {"blue   depth 0.9",       {{0,0,1,1}, 0.9f, 0}, 0, "depthTestFailed"},
-        {"white  depth 0.1 sciss", {{1,1,1,1}, 0.1f, 0}, 1, "scissorClipped"},
-        {"magent depth 0.1 kill",  {{1,0,1,1}, 0.1f, 1}, 0, "shaderDiscarded"},
-        {"yellow depth 0.2",       {{1,1,0,1}, 0.2f, 0}, 0, "PASS"},
+    /* ---- the regions ---------------------------------------------------------------- */
+    const VkRect2D A      = {{0, 0}, {32, 32}};    /* the sequence                        */
+    const VkRect2D A_wide = {{0, 0}, {32, 40}};    /* A plus the strip only arm 1 paints  */
+    const VkRect2D A_tiny = {{0, 0}, {4, 4}};      /* the scissor arm 2 is confined to    */
+    const VkRect2D B      = {{32, 0}, {32, 32}};
+    const VkRect2D C      = {{0, 40}, {32, 24}};
+    const VkRect2D E      = {{32, 32}, {32, 32}};
+
+    const struct arm arms[8] = {
+        {"A1 green  0.5 wide", {{0, 1, 0, 1}, 0.5f, 0}, A_wide, 0, "PASS"},
+        {"A2 white  0.1 tiny", {{1, 1, 1, 1}, 0.1f, 0}, A_tiny, 0, "scissorClipped at A"},
+        {"A3 magent 0.1 kill", {{1, 0, 1, 1}, 0.1f, 1}, A,      0, "shaderDiscarded"},
+        {"A4 yellow 0.2",      {{1, 1, 0, 1}, 0.2f, 0}, A,      0, "PASS"},
+        {"A5 blue   0.9 LAST", {{0, 0, 1, 1}, 0.9f, 0}, A,      0, "depthTestFailed"},
+        {"B  black  0.5",      {{0, 0, 0, 1}, 0.5f, 0}, B,      0, "PASS, computes black"},
+        {"C  bright 0.5 cwm0", {{0, 0.8f, 0.9f, 1}, 0.5f, 0}, C, 1, "PASS, write mask drops it"},
+        {"E  kill   0.5",      {{1, 0.5f, 0, 1}, 0.5f, 1}, E,   0, "shaderDiscarded"},
+    };
+
+    /* What each region must look like afterwards, and the verdict it exists to construct. */
+    const struct probe probes[5] = {
+        {"A  sequence",   16, 16, {255, 255,   0, 255}, "PIXEL_WAS_WRITTEN"},
+        {"A' arm-1 only", 16, 36, {  0, 255,   0, 255}, "(proves arm 1 rendered)"},
+        {"B  black draw", 48, 16, {  0,   0,   0, 255}, "SHADER_WROTE_BLACK"},
+        {"C  no write",   16, 48, {  0,   0,   0, 255}, "STORE_LOST_IT"},
+        {"E  all killed", 48, 48, {  0,   0,   0, 255}, "ALL_REJECTED"},
     };
 
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -353,18 +414,65 @@ int main(void)
     VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = cpool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    r = vkAllocateCommandBuffers(g_dev, &cai, &cmd);
+    cai.commandBufferCount = 2;
+    VkCommandBuffer cmds[2];
+    r = vkAllocateCommandBuffers(g_dev, &cai, cmds);
     if (r) die("vkAllocateCommandBuffers", r);
+    VkCommandBuffer cmd = cmds[0];
 
     VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbi);
 
+    /* Black ground by transfer clear, in its OWN submit BEFORE the capture starts.
+     *
+     * MEASURED, not assumed: RenderDoc's Vulkan pixel history reports vkCmdClearColorImage
+     * as a PASSING modification. A clear inside the captured frame therefore gives every
+     * pixel a passing event, which makes ALL_REJECTED unconstructible -- region E read
+     * SHADER_WROTE_BLACK instead, with the clear as its only passing event. Keeping the
+     * clear outside the capture leaves the ground defined and the frame draws-only. */
+    VkImageMemoryBarrier pre = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    pre.srcAccessMask = 0;
+    pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    pre.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    pre.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    pre.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre.image = color_img;
+    pre.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    pre.subresourceRange.levelCount = 1;
+    pre.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &pre);
+    VkClearColorValue black = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    vkCmdClearColorImage(cmd, color_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black,
+                         1, &pre.subresourceRange);
+    pre.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    pre.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    pre.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    pre.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL,
+                         1, &pre);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo ground = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    ground.commandBufferCount = 1; ground.pCommandBuffers = &cmd;
+    r = vkQueueSubmit(g_queue, 1, &ground, VK_NULL_HANDLE);
+    if (r) die("vkQueueSubmit(ground)", r);
+    r = vkQueueWaitIdle(g_queue);
+    if (r) die("vkQueueWaitIdle(ground)", r);
+
+#ifdef PROSPER_PIXHIST_CAPTURE
+    capture_begin(argv[1]);
+#endif
+    cmd = cmds[1];
+    vkBeginCommandBuffer(cmd, &cbi);
+
     VkClearValue clears[2];
-    clears[0].color.float32[0] = 1.0f; clears[0].color.float32[1] = 0.0f;
-    clears[0].color.float32[2] = 0.0f; clears[0].color.float32[3] = 1.0f;  /* RED */
+    clears[0].color.float32[0] = 0.0f; clears[0].color.float32[1] = 0.0f;
+    clears[0].color.float32[2] = 0.0f; clears[0].color.float32[3] = 1.0f;
     clears[1].depthStencil.depth = 1.0f;
     clears[1].depthStencil.stencil = 0;
     VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -372,10 +480,10 @@ int main(void)
     rbi.renderArea = full;
     rbi.clearValueCount = 2; rbi.pClearValues = clears;
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    VkRect2D narrow = {{0, 0}, {4, 4}};
-    for (int i = 0; i < 5; ++i) {
-        vkCmdSetScissor(cmd, 0, 1, arms[i].narrow_scissor ? &narrow : &full);
+    for (int i = 0; i < 8; ++i) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          arms[i].no_color_write ? pipeline_no_write : pipeline);
+        vkCmdSetScissor(cmd, 0, 1, &arms[i].scissor);
         vkCmdPushConstants(cmd, layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(struct push), &arms[i].pc);
@@ -414,19 +522,23 @@ int main(void)
     r = vkQueueWaitIdle(g_queue);
     if (r) die("vkQueueWaitIdle", r);
 
-    /* ---- self-check: the construction must have rendered as designed ---------------- */
+    /* ---- self-check: every region must have reached its intended final state ---------- */
     void *mapped = NULL;
     r = vkMapMemory(g_dev, readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped);
     if (r) die("vkMapMemory", r);
-    const unsigned char *px = (const unsigned char *)mapped + (PROBE_Y * DIM + PROBE_X) * 4;
-    const unsigned char want[4] = {255, 255, 0, 255};   /* yellow: draw 5 won */
-    int ok = memcmp(px, want, 4) == 0;
-
-    printf("probe pixel (%u,%u) = %u,%u,%u,%u (expected %u,%u,%u,%u)\n",
-           PROBE_X, PROBE_Y, px[0], px[1], px[2], px[3],
-           want[0], want[1], want[2], want[3]);
-    for (int i = 0; i < 5; ++i)
-        printf("  arm %d  %-24s expect %s\n", i + 1, arms[i].name, arms[i].expect);
+    int ok = 1;
+    for (int i = 0; i < 5; ++i) {
+        const unsigned char *px =
+            (const unsigned char *)mapped + (probes[i].y * DIM + probes[i].x) * 4;
+        int good = memcmp(px, probes[i].want, 4) == 0;
+        ok &= good;
+        printf("  %-14s (%2u,%2u) = %3u,%3u,%3u,%3u  want %3u,%3u,%3u,%3u  %-19s %s\n",
+               probes[i].region, probes[i].x, probes[i].y, px[0], px[1], px[2], px[3],
+               probes[i].want[0], probes[i].want[1], probes[i].want[2], probes[i].want[3],
+               probes[i].verdict, good ? "ok" : "MISMATCH");
+    }
+    for (int i = 0; i < 8; ++i)
+        printf("  arm %d  %-20s expect %s\n", i + 1, arms[i].name, arms[i].expect);
     printf("PIXEL_HISTORY_CONTROL=%s\n", ok ? "CONSTRUCTED" : "MISRENDERED");
     if (!ok)
         fprintf(stderr, "the control did not render as designed; do not validate against it\n");

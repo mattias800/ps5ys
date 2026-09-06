@@ -4,10 +4,12 @@ import unittest
 import pixel_history as ph
 
 
-def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1):
+def ev(passed, rejected=(), shader=None, post=(0.0, 0.0, 0.0, 1.0), eid=1, suppressed=None):
+    if suppressed is None:
+        suppressed = ph.suppress_shader_output(rejected)
     return {"eventId": eid, "passed": passed, "rejected_by": list(rejected),
-            "shaderOut": None if shader is None else list(shader),
-            "shader_output_suppressed": shader is None and bool(rejected),
+            "shaderOut": None if suppressed else (None if shader is None else list(shader)),
+            "shader_output_suppressed": suppressed,
             "postMod": list(post)}
 
 
@@ -36,13 +38,36 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(lost, "STORE_LOST_IT")
 
     def test_stale_shader_output_cannot_manufacture_store_lost_it(self):
-        # The trap the control caught: a scissored event carries the PREVIOUS draw's
-        # colour. If that value were trusted, a frame where nothing survived would be
-        # reported as a blend/write-mask defect and send the reader to the wrong file.
+        # Trap 268 end to end: the scissored event carries the PREVIOUS draw's bright
+        # colour. `suppressed=False` forces the pre-fix behaviour into the fixture, so this
+        # fails unless classify() refuses to derive a verdict from a rejected event.
+        stale = ev(False, ["scissorClipped"], shader=(0.9, 0.9, 0.9, 1), suppressed=False)
         passing_black = ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1))
-        scissored = ev(False, ["scissorClipped"], shader=None, post=(0, 0, 0, 1))
-        v, _ = ph.classify([scissored, passing_black])
+        v, _ = ph.classify([stale, passing_black])
         self.assertEqual(v, "SHADER_WROTE_BLACK")
+
+    def test_legitimately_overdrawn_bright_writer_is_not_a_lost_store(self):
+        # A white sky, then a black object correctly drawn in front of it. Reading ANY
+        # passing event made SHADER_WROTE_BLACK unreachable on every pixel with history --
+        # which is most of a real frame, and precisely the frames people investigate.
+        sky = ev(True, shader=(1, 1, 1, 1), post=(1, 1, 1, 1), eid=10)
+        obj = ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1), eid=20)
+        self.assertEqual(ph.classify([sky, obj])[0], "SHADER_WROTE_BLACK")
+
+    def test_store_lost_it_still_reachable_after_an_overdraw(self):
+        sky = ev(True, shader=(1, 1, 1, 1), post=(1, 1, 1, 1), eid=10)
+        lost = ev(True, shader=(0.6, 0.3, 0.1, 1), post=(0, 0, 0, 1), eid=20)
+        self.assertEqual(ph.classify([sky, lost])[0], "STORE_LOST_IT")
+
+    def test_unbound_pixel_shader_is_not_a_clean_pass(self):
+        # Passed() excludes unboundPS (data_types.h:2759), so the event arrives passed=True
+        # while its output is documented as undefined. Deriving STORE_LOST_IT from that is
+        # trap 268 one list entry over.
+        self.assertTrue(ph.suppress_shader_output(["unboundPS"]))
+        v, why = ph.classify([ev(True, ["unboundPS"], shader=(0.8, 0.8, 0.8, 1),
+                                  post=(0, 0, 0, 1))])
+        self.assertEqual(v, "OUTPUT_UNTRUSTED")
+        self.assertIn("unboundPS", why)
 
     def test_a_rejected_event_never_counts_as_the_final_colour(self):
         v, _ = ph.classify([ev(True, shader=(0, 0, 0, 1), post=(0, 0, 0, 1)),
@@ -58,31 +83,49 @@ class ClassifyTests(unittest.TestCase):
 
 
 class ControlCheckTests(unittest.TestCase):
-    def good(self):
-        return [ev(True, post=(1, 0, 0, 1)), ev(True, shader=(0, 1, 0, 1), post=(0, 1, 0, 1)),
-                ev(False, ["depthTestFailed"], shader=(0, 0, 1, 1)),
-                ev(False, ["scissorClipped"], shader=None),
-                ev(False, ["shaderDiscarded"], shader=(0, 0, 0, 0)),
-                ev(True, shader=(1, 1, 0, 1), post=(1, 1, 0, 1))]
+    """check_control must fail on a wrong READING, not merely on a wrong final picture."""
+
+    def regions(self):
+        seq = [ev(True, shader=(0, 1, 0, 1), post=(0, 1, 0, 1), eid=1),
+               ev(False, ["scissorClipped"], eid=2),
+               ev(False, ["shaderDiscarded"], shader=(0, 0, 0, 0), eid=3),
+               ev(True, shader=(1, 1, 0, 1), post=(1, 1, 0, 1), eid=4),
+               ev(False, ["depthTestFailed"], shader=(0, 0, 1, 1), eid=5)]
+        return {"A  sequence": {"verdict": "PIXEL_WAS_WRITTEN", "events": seq},
+                "A' arm-1 only": {"verdict": "PIXEL_WAS_WRITTEN", "events": []},
+                "B  black draw": {"verdict": "SHADER_WROTE_BLACK", "events": []},
+                "C  no write": {"verdict": "STORE_LOST_IT", "events": []},
+                "E  all killed": {"verdict": "ALL_REJECTED", "events": []}}
 
     def test_correct_reading_passes(self):
-        self.assertEqual(ph.check_control(self.good()), [])
+        self.assertEqual(ph.check_control(self.regions()), [])
 
-    def test_wrong_outcome_order_is_caught(self):
-        bad = self.good()
-        bad[2], bad[3] = bad[3], bad[2]
-        self.assertTrue(ph.check_control(bad))
+    def test_every_region_verdict_is_checked(self):
+        # Each region exists to construct one verdict; a tool that collapsed them all to the
+        # same answer would still satisfy a check that only looked at one.
+        for name in ("A  sequence", "B  black draw", "C  no write", "E  all killed"):
+            bad = self.regions()
+            bad[name]["verdict"] = "NOTHING_DREW"
+            self.assertTrue(ph.check_control(bad), name)
+
+    def test_missing_region_is_caught(self):
+        bad = self.regions()
+        del bad["C  no write"]
+        self.assertIn("missing", " ".join(ph.check_control(bad)))
+
+    def test_misattributed_rejection_is_caught(self):
+        # The reading stays well-formed and the verdict stays right; only the REASON is
+        # wrong. That is the failure a final-picture check cannot see.
+        bad = self.regions()
+        bad["A  sequence"]["events"][4] = ev(False, ["stencilTestFailed"],
+                                             shader=(0, 0, 1, 1), eid=5)
+        self.assertIn("depthTestFailed", " ".join(ph.check_control(bad)))
 
     def test_unsuppressed_stale_output_is_caught(self):
-        bad = self.good()
-        bad[3] = ev(False, ["scissorClipped"], shader=(0, 0, 1, 1))
+        bad = self.regions()
+        bad["A  sequence"]["events"][1] = ev(False, ["scissorClipped"], shader=(0, 0, 1, 1),
+                                             eid=2, suppressed=False)
         self.assertIn("stale-value suppression", " ".join(ph.check_control(bad)))
-
-    def test_wrong_final_colour_is_caught(self):
-        bad = self.good()
-        bad[-1] = ev(True, shader=(1, 1, 0, 1), post=(1, 1, 1, 1))
-        self.assertTrue(ph.check_control(bad))
-
 
 
 class SuppressionTests(unittest.TestCase):

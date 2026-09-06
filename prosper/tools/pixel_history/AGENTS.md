@@ -19,25 +19,33 @@ What lives here:
   the per-event detail behind it. It refuses to report at all if the replay driver says it
   has no pixel-history support, because an empty history and an unsupported driver look
   identical and mean opposite things.
-- `control.c` + `shaders/` — a construction with a **known answer**: five full-screen draws
-  at one named pixel, differing in exactly one property each, engineered to produce a pass,
-  a depth failure, a scissor rejection, a shader discard and a final pass. Run
-  `pixel_history.py --expect-control` against its capture on any new driver before
-  trusting the tool there.
+- `control.c` + `shaders/` — a construction with a **known answer**, in five regions that each
+  produce a **different verdict**: the draw sequence (`PIXEL_WAS_WRITTEN`), a passing draw that
+  computes black (`SHADER_WROTE_BLACK`), a passing draw through a `colorWriteMask=0` pipeline
+  (`STORE_LOST_IT`), and a region where every draw is discarded (`ALL_REJECTED`). A control that
+  only ever produced one verdict would test the machinery and not the distinctions. Run
+  `pixel_history.py --expect-control` against its capture on any new driver before trusting the
+  tool there; it checks every region's verdict *and* every rejection reason, which is the part a
+  final picture cannot see.
 - `test_pixel_history.py` — the verdict logic, which is the part CI can reach.
 
 ## The control is not ceremony
 
-It has already earned itself once. RenderDoc populates `shaderOut` for events whose
-fragment shader **never ran** — a scissored draw reports the *previous* draw's colour. On
-a game capture that is invisible: the number looks like a shader output and there is
-nothing to check it against. The control caught it immediately, because the value it
-reported belonged to a draw whose colour was known to be different. The tool now suppresses
-shader output for every rejection that happens before fragment execution, and says
-`suppressed (no fragment ran)` rather than printing a plausible lie.
+It has earned itself **twice**, and both times against an assumption that looked safe.
 
-Generalise from that: **a tool that reads a value cannot tell you the value is meaningful.**
-Only a construction whose answer you already know can.
+1. **RenderDoc populates `shaderOut` for events whose fragment shader never ran** — a scissored
+   draw reports the *previous* draw's colour. On a game capture that is invisible: the number
+   looks like a shader output and there is nothing to check it against. The control caught it
+   because the value belonged to a draw whose colour was known to be different. Instrument
+   trap 268.
+2. **A `vkCmdClearColorImage` IS a pixel-history event, and it passes.** The control's own
+   comment had asserted the opposite. A region whose every draw was discarded read
+   `SHADER_WROTE_BLACK` instead of `ALL_REJECTED`, because the clear sat in its history as a
+   passing black event. The clear now happens before the capture starts. Instrument trap 269.
+
+Generalise from both: **a tool that reads a value cannot tell you the value is meaningful.**
+Only a construction whose answer you already know can. Note that in each case the wrong belief
+was written down as a confident comment first — reasoning about an API is not measuring it.
 
 ## Boundary
 
