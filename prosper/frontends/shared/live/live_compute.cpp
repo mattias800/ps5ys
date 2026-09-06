@@ -4,6 +4,7 @@
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
+#include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/live_target_format.hpp"
 #include "shared/rtt/rtt_scale.hpp"
@@ -5551,8 +5552,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         uint64_t written_layers = ~0ULL;
         bool near_full = false;
     };
-    // key = (shader code_addr, output binding, width, height, depth) -- collision-free by construction.
-    using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>;
+    // Coverage was observed over the shared image, so its writer membership is part of the proof.
+    // Splitting a previously full-coverage alias group can leave the owner only partially written.
+    using SeedCoverageKey = std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                       std::vector<uint32_t>>;
     static std::mutex seed_coverage_mu;
     static std::map<SeedCoverageKey, SeedVerdict> seed_coverage_proof;
     // PROSPER_SEED_REPROVE=N: re-prove every N fast-skips (default 256; explicit 0 disables = old
@@ -5778,6 +5781,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     std::sort(image_descriptors.begin(), image_descriptors.end(), [](const auto& a, const auto& b) {
         return a.binding < b.binding;
     });
+    const auto image_alias_plan = item.resources
+        ? prosper::frontend::plan_storage_image_aliases(image_descriptors, *item.resources)
+        : prosper::frontend::StorageImageAliasPlan{};
+    if (!image_alias_plan.valid) return decline("storage-alias-resource-missing");
+    const auto image_seed_coverage_key = [&](size_t i, const ShaderResource& resource) {
+        return SeedCoverageKey{
+            item.code_addr, image_descriptors[i].binding,
+            resource.width, resource.height, resource.depth,
+            image_alias_plan.groups[image_alias_plan.group_for_image[i]].bindings};
+    };
 
     const LiveComputeBufferDescriptorPlan buffer_plan =
         plan_live_compute_buffer_descriptors(
@@ -6533,8 +6546,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (dim_cube_stacked && (r->depth < 6 || r->height > UINT32_MAX / 6u)) {
                 skip_image(r, "cube image does not contain six valid faces"); break;
             }
-            bi.texel_depth = dim_3d ? r->depth : 1u;
-            bi.array_layers = dim_2d_array ? r->depth : 1u;
+            const auto alias_shape = prosper::frontend::compute_image_alias_shape(
+                *r, image_descriptors[i]);
+            bi.texel_depth = alias_shape.texel_depth;
+            bi.array_layers = alias_shape.array_layers;
             if (cube_face_as_2d && trace)
                 std::fprintf(stderr,
                              "[compute]   binding cube face zero as shader-declared 2D image "
@@ -6766,10 +6781,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 r->width, r->height, r->depth, 16);
             // Diagnostic: force the proving (poison) path on every eligible dispatch, never fast-skip.
             static const bool force_verify = std::getenv("PROSPER_VERIFY_SEED_SKIP") != nullptr;
-            if (bi.storage && seed_skip_enabled && !image_descriptors[i].readable &&
-                image_descriptors[i].writable && enough_threads) {
-                const SeedCoverageKey proof_key{item.code_addr, bi.binding,
-                                                r->width, r->height, r->depth};
+            // A write-only descriptor can share this image with a readable sibling. Poisoning
+            // would corrupt values consumed during execution even if writeback later restored the
+            // untouched image texels. Decide from the whole group before consulting ANY proof.
+            if (bi.storage && seed_skip_enabled &&
+                image_alias_plan.groups[image_alias_plan.group_for_image[i]].can_discard_seed() &&
+                enough_threads) {
+                const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                 bool proven_full = false, proven_none = false, known = false, reprove_due = false;
                 {
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
@@ -10275,8 +10293,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.written_layers_mask = written_layers;
                 bi.near_full_coverage = near_full;
                 {
-                    const SeedCoverageKey proof_key{item.code_addr, bi.binding,
-                                                    r->width, r->height, r->depth};
+                    const SeedCoverageKey proof_key = image_seed_coverage_key(i, *r);
                     std::lock_guard<std::mutex> lk(seed_coverage_mu);
                     // Re-cache the freshly-proven verdict; skips=0 restarts the #1127 re-prove interval.
                     seed_coverage_proof[proof_key] = SeedVerdict{ cov, 0, written_layers, near_full };

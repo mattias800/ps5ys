@@ -129,6 +129,31 @@ used by the instruction. It then makes the referenced guest bytes or image avail
 and passes the resulting `ShaderResourceTable` into recompilation. Runtime-selected arrays extend this
 same contract with reflected descriptor count and dynamic-index metadata; they are not a parallel path.
 
+## Storage-image alias seed authority
+
+Live compute resolves each dispatch's exact storage-image alias groups before preparing their
+canonical images (`frontends/shared/compute/storage_image_alias_plan.hpp`). Access is a group
+property: any readable or atomic member prohibits seed omission and destructive poison proving.
+The plan follows the existing late-fold identity, including view shape, capture backing and DCC;
+it does not change which descriptors actually share a Vulkan image. Sampled images remain separate.
+
+Cached coverage verdicts include the sorted group binding set. Moving an intact group does not
+change that identity, but joining or splitting does: two writers may cover an entire image together
+while neither does alone, and a previously inactive owner may gain a writer. Both proof lookup and
+publication use the same member-aware key. These are seed-safety constraints, not a static proof
+that a shader's coverage is invariant under arbitrary input changes (#3391).
+
+### Ruled out: per-binding seed safety
+
+- **A write-only owner's reflection is sufficient to omit seed data, provided untouched image
+  texels are restored afterwards:** falsified by a race-free storage-image read into an independent
+  SSBO. Restoring the image cannot repair values already consumed by another output. Reverting
+  only the access union produces seven exact-read failures in cold, warm and newly joined cases;
+  reader-first controls pass (#3391).
+- **Code, owner binding and extents identify a reusable coverage verdict regardless of alias
+  membership:** falsified by fixed-code, fixed-extent split/join fixtures. Reverting only membership
+  in the proof key produces two stale-Full and two stale-None failures (#3391).
+
 ## Ruled out
 
 Cross-title falsifications about **how the user-data / SH register block reaches a stage**. One line
