@@ -174,26 +174,36 @@ int main() {
 
         // Sampling an unrelated surface: the direct image serves.
         CHECK(mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
-                                /*is_storage_image=*/false, /*img_dim=*/1u,
+                                /*is_storage_image=*/false, /*img_dim=*/1u, 1u, 1u,
                                 /*extent_compatible=*/true, /*has_persistent_target=*/true,
                                 format_defined));
         // Sampling THIS pass's MRT2: it must not, or the descriptor and the colour attachment
         // become the same image.
-        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, true, true,
+        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, 1u, 1u, true, true,
                                  format_defined));
-        CHECK(mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, true, true,
+        CHECK(mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 1u, 1u, 1u, true, true,
                                 format_defined, /*feedback_copy_supported=*/true));
         // The non-feedback preconditions still gate it.
         CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
-                                 /*is_storage_image=*/true, 1u, true, true,
+                                 /*is_storage_image=*/true, 1u, 1u, 1u, true, true,
                                  format_defined));
-        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
-                                 false, /*img_dim=*/5u, true, true,
+        CHECK(mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
+                                 false, /*img_dim=*/5u, 1u, 1u, true, true,
                                  format_defined));
+        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 5u, 1u, 1u,
+                                 true, true, format_defined));
+        CHECK(mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 5u, 1u, 1u,
+                                true, true, format_defined, true));
+        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 5u, 2u, 1u,
+                                 true, true, format_defined, true));
+        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 5u, 1u, 4u,
+                                 true, true, format_defined, true));
+        CHECK(!mrt_direct_serves(draw, kMrt2, 64u, 32u, false, 2u, 1u, 1u,
+                                 true, true, format_defined, true));
         CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u,
-                                 false, 1u, /*extent_compatible=*/false,
+                                 false, 1u, 1u, 1u, /*extent_compatible=*/false,
                                  true, format_defined));
-        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u, false, 1u, true,
+        CHECK(!mrt_direct_serves(draw, 0x2099cc0000ull, 64u, 32u, false, 1u, 1u, 1u, true,
                                  /*has_persistent_target=*/false, format_defined));
 
         // The uniform fast path carries the same gate. It and mrt_direct_serves must agree: if this
@@ -214,7 +224,7 @@ int main() {
         masked.color_targets[2].base = kMrt2;
         masked.ps.color_targets[2].format = 37u;
         masked.ps.color_targets[2].write_mask = 0u;
-        CHECK(mrt_direct_serves(masked, kMrt2, 64u, 32u, false, 1u, true, true,
+        CHECK(mrt_direct_serves(masked, kMrt2, 64u, 32u, false, 1u, 1u, 1u, true, true,
                                 format_defined));
     }
 

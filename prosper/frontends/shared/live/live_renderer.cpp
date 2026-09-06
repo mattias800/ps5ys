@@ -3234,7 +3234,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // resource fell through to stale guest bytes with no snapshot to use.
                             const bool direct_serves = prosper::frontend::mrt_direct_serves(
                                 draw, sampled_source_addr, tw, th,
-                                fr.is_storage_image, r.img_dim,
+                                fr.is_storage_image, r.img_dim, r.depth, r.sample_count,
                                 sampled_extent_compatible,
                                 prosper::test::find_persistent_color_target(
                                     sampled_source_addr, surface.w, surface.h,
@@ -3313,7 +3313,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // A retained render target was created for color-attachment + sampled usage,
                         // not storage usage. Storage images therefore take the decoded/upload path.
                         const bool has_gpu_live_rtt = !fr.is_storage_image && live_gpu_targets &&
-                            r.img_dim == 1u &&
+                            prosper::frontend::rtt_single_layer_sample_shape(
+                                r.img_dim, r.depth, r.sample_count) &&
                             live_rtt != g_rtt.end() && live_rtt->second.gpu_valid &&
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
@@ -4309,6 +4310,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.tw = live_rtt->second.w;
                             fr.th = live_rtt->second.h;
                             fr.td = 1; fr.img_dim = r.img_dim;
+                            // A depth-one T# array can compile to either a base-slice 2D image or
+                            // a real arrayed image. Bind the view the shader actually declared.
+                            fr.guest_array = reflected_binding->image_arrayed;
                             fr.texture_format = live_rtt->second.format;
                             // CB_COLOR renders one mip view per target, while this T# samples the
                             // complete allocation. Reconstruct the target identities and retain
@@ -8715,7 +8719,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     const bool sampled_extent_compatible =
                                         prosper::frontend::rtt_sampled_extent_compatible(
                                             rw, rh, gw, gh, render_scale, false);
-                                    if (resource.img_dim == 1u && sampled_extent_compatible) {
+                                    const bool sampled_shape =
+                                        prosper::frontend::rtt_single_layer_sample_shape(
+                                            resource.img_dim, resource.depth, resource.sample_count);
+                                    if (sampled_shape && sampled_extent_compatible) {
                                         result.sampled_exact = true;
                                         result.feedback |= same_pass_target;
                                     }
@@ -8724,13 +8731,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     // the render pass. Storage, dimension, and extent mismatches still
                                     // require the CPU representation.
                                     const bool direct_bindable =
-                                        resource.cls == RC::Texture && resource.img_dim == 1u &&
+                                        resource.cls == RC::Texture && sampled_shape &&
                                         sampled_extent_compatible;
                                     if (!direct_bindable) {
                                         result.cpu_needed = true;
                                         result.storage_references +=
                                             resource.cls == RC::StorageImage;
-                                        result.dimension_mismatches += resource.img_dim != 1u;
+                                        result.dimension_mismatches += !sampled_shape;
                                         result.extent_mismatches += !sampled_extent_compatible;
                                         result.feedback_references += same_pass_target;
                                         static const uint64_t diagnose_min_submit = [] {
@@ -8757,7 +8764,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                         ? "storage" : "texture",
                                                     resource.img_dim, rw, rh, gw, gh,
                                                     resource.cls == RC::StorageImage ? 1u : 0u,
-                                                    resource.img_dim != 1u ? 1u : 0u,
+                                                    !sampled_shape ? 1u : 0u,
                                                     !sampled_extent_compatible ? 1u : 0u,
                                                     same_pass_target ? 1u : 0u);
                                         }

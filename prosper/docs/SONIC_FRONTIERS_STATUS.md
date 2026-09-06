@@ -8,6 +8,33 @@ own embedded shader source paths (`Library\hedgehog\…`, `Library\needle\…`) 
 
 ## Current rung — gameplay reached, world not rendered
 
+### Intro audio and retained color targets (2026-09-07, #3411 / #3415)
+
+AudioOut2 now owns a separate float buffer for every port/channel and consumes each submitted grain
+once. The guest shares a scratch address between its MAIN and auxiliary outputs; copying only at
+Push lost MAIN audio, and repeating the last saved grain produced buzzing. The listener confirmed
+recognizable Sonic ring audio after the fix. Severe delivery gaps remain; see `AUDIO.md` for the
+submission measurements and regression tests.
+
+One-layer `img_dim=5` color samples now pass all four retained-target gates: later-consumer
+inspection, lazy readback suppression, frontend target selection, and backend borrowing. Multi-layer,
+MSAA, storage, and incompatible extents remain excluded. The sampled view follows SPIR-V reflection;
+this title's depth-one descriptors ordinarily compile to non-arrayed base-slice images. No mutable
+UNORM/UINT reinterpretation from the #3407 WIP branch is enabled.
+
+Two 105-second windowed immediate-present runs used separate fresh save directories, audio-flow and
+readback-reason diagnostics, and no concurrent builds. The baseline at `46f9853e` presented **470**
+frames; the changed binary presented **1,086** (**2.31×**). Their last cumulative readback reports
+showed `same_batch_cpu=6247/128061MB` and `same_batch_cpu=0/0MB`, respectively (the diagnostic's MB
+unit is MiB, and reports are periodic, not final totals). These counters do not include every
+compute-side rematerialization. Fresh MAIN submissions increased from roughly 35–40 to 80–92 per
+second, still below the required 188. The listener confirmed correct colors and audio in the faster
+run; smooth audio is not yet established.
+
+`mrt_binding` and `texture_sample_render` pass. The latter checks exact CPU-reference pixels for 2D
+and arrayed views of a retained single-layer image, including feedback copies; its Vulkan validation
+messenger was active and reported no errors or warnings.
+
 A committed input route (`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`) takes the title
 from boot to **`GameModeStage` running a Cyber Space stage (`w6d01`)** with real GPU work: the
 guest streams all one hundred `w6d01_trr_s00..s99` terrain sectors plus `w6d01_gedit`, loads

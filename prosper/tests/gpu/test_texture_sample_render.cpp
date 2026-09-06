@@ -590,6 +590,32 @@ int main() {
                   sampled_stats.sampled_hits == 1,
               "GPU-resident target sampling matches CPU readback+upload byte-for-byte");
 
+        // #3415: a depth-one array can borrow the retained 2D subresource. Exercise both shader
+        // interfaces: the recompiler's ordinary base-slice view and a real arrayed view sampling
+        // layer zero. The latter uses a layered BC descriptor solely to generate Arrayed=1;
+        // the backend binds one retained layer, not that descriptor's source storage.
+        for (bool arrayed : {false, true}) {
+            auto array_rt = rt;
+            array_rt.resources[0].img_dim = 5;
+            array_rt.resources[0].depth = arrayed ? 2 : 1;
+            if (arrayed) array_rt.resources[0].format = DataFormat::Bc7;
+            auto array_sample = gpu_sample;
+            array_sample.fs = recompile_fragment(sample_ps.data(), sample_ps.size(), &array_rt);
+            array_sample.R[0].img_dim = 5;
+            array_sample.R[0].guest_array = arrayed;
+            CHECK(!array_sample.fs.empty(), "single-layer target consumer shader recompiles");
+            const auto pixels = prosper::test::render_draws_rgba({array_sample}, W, H);
+            CHECK(pixels == cpu_roundtrip &&
+                      prosper::test::backend_color_target_stats().sampled_hits == 1,
+                  "single-layer retained target matches the CPU reference for either view type");
+            prosper::test::BackendColorTarget feedback_target{target_id, true, true};
+            const auto feedback_pixels = prosper::test::render_draws_rgba(
+                {array_sample}, W, H, nullptr, nullptr, false, &feedback_target);
+            CHECK(feedback_pixels == cpu_roundtrip &&
+                      prosper::test::backend_color_target_stats().sampled_hits == 1,
+                  "single-layer array feedback snapshots the retained source before drawing");
+        }
+
         prosper::test::FrameResource bgra_gpu_resource = gpu_resource;
         bgra_gpu_resource.render_target_guest_format = VK_FORMAT_B8G8R8A8_UNORM;
         bgra_gpu_resource.swizzle[0] = 6u;

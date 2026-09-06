@@ -18,6 +18,13 @@
 // which an exact integer-ratio check incorrectly sent through CPU readback.
 namespace prosper::frontend {
 
+// Retained color targets contain one single-sampled 2D subresource. A depth-one array may view
+// that same subresource; its Vulkan view must still match the consuming shader's arrayedness.
+constexpr bool rtt_single_layer_sample_shape(uint32_t dimension, uint32_t layers,
+                                             uint32_t samples) {
+    return (dimension == 1u || dimension == 5u) && layers == 1u && samples == 1u;
+}
+
 constexpr uint32_t rtt_integer_upscale_factor(uint32_t dst_w, uint32_t dst_h,
                                               uint32_t src_w, uint32_t src_h) {
     if (!src_w || !src_h || dst_w <= src_w || dst_h <= src_h) return 0;

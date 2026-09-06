@@ -7769,7 +7769,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         }
                         if (!upload.borrowed_compute && !r.is_storage_image &&
                             !upload.assembled_target_mips && persistent_color_targets_enabled &&
-                            r.persistent_render_target_id && r.img_dim == 1) {
+                            r.persistent_render_target_id &&
+                            prosper::frontend::rtt_single_layer_sample_shape(
+                                r.img_dim, r.td, r.sample_count)) {
                             if (auto* target = find_persistent_color_target(
                                     r.persistent_render_target_id, r.tw, r.th,
                                     backend_color_format(r.texture_format))) {
@@ -8033,13 +8035,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // correct sRGB fix is a coordinated linear-working-space + output-encode change (see the
                     // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
                     tvci.image = upload.image;
-                    // #325: a guest 2D_ARRAY takes an ARRAY view even at one layer. The view type
-                    // has to agree with what the consuming SPIR-V declared, and the recompiler
-                    // decides that from the T# (`res->img_dim == 5`) -- which it can do without
-                    // knowing how many layers the uploader managed to decode. Keying the view on
-                    // the layer COUNT instead would silently disagree whenever an array resolved to
-                    // a single layer, binding a 2D view under an `Arrayed=1` OpTypeImage. A
-                    // one-layer 2D_ARRAY view is perfectly legal and samples layer 0.
+                    // View type follows the shader-facing representation, not the layer count.
+                    // Retained color samples carry reflected arrayedness (#3415); ordinary texture
+                    // uploads share the recompiler's array predicate (#325). A one-layer ARRAY view
+                    // is legal, but img_dim=5 alone also occurs with non-arrayed base-slice shaders.
                     tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D
                         : (r.guest_array || r.sample_count > 1u) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                                                  : VK_IMAGE_VIEW_TYPE_2D;
