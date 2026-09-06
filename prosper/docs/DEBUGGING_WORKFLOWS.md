@@ -149,6 +149,15 @@ The scheduler probe is a capability test, not a game profiler. To measure schedu
 use system-wide switch/wakeup events and filter the report to the game's threads: wakeups may
 be emitted by a different task, so a recording filtered only to the game's PID can lose the cause.
 
+**Two routes, and they answer different questions.** The probe below establishes that this host
+can record and decode scheduler events at all, using `sudo` interactively. If you need scheduler
+recording *without a human at the keyboard*, [`tools/profiling_access/`](../tools/profiling_access/README.md)
+is the sanctioned route: one administrator installation grants one account passwordless access to
+a scheduler-only, duration- and byte-bounded helper — not unrestricted `perf`, and not a root
+shell. Prefer it over widening `sudo` or relaxing global perf settings to get an unattended
+capture. Neither route changes what the recording proves: event capture, not loss-free attribution
+to a particular game thread.
+
 First verify access with a two-second recording on the **host**, using a new output directory:
 
 ```bash
