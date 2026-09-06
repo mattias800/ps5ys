@@ -196,6 +196,8 @@ public:
     static GuestWriteWatch create(uint64_t addr, uint64_t size);
     explicit operator bool() const { return id_ != 0; }
     GuestWriteWatchQuery query() const;
+    // A removed/replaced original mapping or a changed alias protection requires reset/create;
+    // rearm cannot retarget a watch to new physical memory or bless stale protection metadata.
     bool rearm();
     void reset();
 
@@ -207,7 +209,7 @@ private:
 GuestWriteWatchStats guest_write_watch_stats();
 
 // Direct-memory mapping notifications. A topology/protection change invalidates existing watches;
-// their next query is Unknown and the exact path may establish a fresh complete registration.
+// their next query is Dirty/Unknown and the exact path may establish a fresh complete registration.
 void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size, uint64_t phys,
                                                     uint32_t protection);
 void guest_write_watch_notify_direct_mapping_removed(uint64_t addr, uint64_t size);

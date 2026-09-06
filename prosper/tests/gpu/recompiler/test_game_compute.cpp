@@ -6099,6 +6099,30 @@ int main() {
                 CHECK(prosper::frontend::execute_live_compute_items({it}) &&
                           fill_equals(after_prove),
                       "ordinary writeback repairs a guest store after watch reuse");
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes);
+                CHECK(mmap(fill_guest, fill_mapping_bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == fill_guest,
+                      "replace warm storage target backing at the same virtual address");
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes,
+                    0x33860000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
+                CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
+                          prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "full writers rebuild authority after guest target remapping");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "replacement mapping obtains fresh cross-submit export authority");
+                dynamic_import = {};
+                fill_guest[0] ^= 0xff;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import),
+                      "CPU store to remapped target revokes the recreated export watch");
+                CHECK(prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "ordinary writeback repairs the remapped target after its CPU store");
             }
 #endif
 

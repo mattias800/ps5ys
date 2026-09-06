@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <initializer_list>
 
 using prosper::host::GuestWriteWatch;
 using prosper::host::GuestWriteWatchQuery;
@@ -202,6 +203,13 @@ int main() {
     prosper::host::guest_write_watch_notify_direct_mapping_protection(
         reinterpret_cast<uint64_t>(a + page), page, kCpuRw);
 
+    // Explicit guest protection changes require fresh alias metadata; ordinary content writes
+    // below still rearm the same registration without recreating it.
+    CHECK(!watch.rearm() && watch.query() == GuestWriteWatchQuery::Dirty,
+          "guest re-protection invalidates the old registration even after restoring permissions");
+    watch.reset();
+    watch = GuestWriteWatch::create(reinterpret_cast<uint64_t>(a), size);
+    CHECK(static_cast<bool>(watch), "recreate the watch after guest re-protection");
     // Re-arm, don't write -> Unchanged again.
     CHECK(watch.rearm(), "rearm succeeds");
     CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "no write since rearm -> Unchanged");
@@ -273,6 +281,119 @@ int main() {
     CHECK(watch.query() == GuestWriteWatchQuery::Dirty,
           "a page still covered by a surviving alias keeps faulting after a sibling alias is removed (B4)");
     munmap(c, size);
+
+    // A partial remap of the ORIGINAL watched VA must force a new registration. Exercise both
+    // an orphaned old page and a surviving old-physical sibling alias: nonempty alias coverage
+    // alone cannot prove that this watch still describes the requested address.
+    for (bool keep_old_alias : {false, true}) {
+        const size_t remap_bytes = page * 3;
+        const uint64_t old_phys = keep_old_alias ? 0xc10000 : 0xc00000;
+        const uint64_t new_phys = old_phys + 0x8000;
+        int old_fd = memfd_create("prosper-ww-remap-old", 0);
+        int new_fd = memfd_create("prosper-ww-remap-new", 0);
+        CHECK(old_fd >= 0 && new_fd >= 0, "remap memfds created");
+        if (old_fd < 0 || new_fd < 0) return 1;
+        CHECK(ftruncate(old_fd, static_cast<off_t>(remap_bytes)) == 0 &&
+                  ftruncate(new_fd, static_cast<off_t>(page)) == 0,
+              "remap memfds sized");
+        auto* original = static_cast<uint8_t*>(mmap(
+            nullptr, remap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, old_fd, 0));
+        CHECK(original != MAP_FAILED, "original remap range mapped");
+        if (original == MAP_FAILED) return 1;
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(original), remap_bytes, old_phys, kCpuRw);
+        uint8_t* sibling = nullptr;
+        if (keep_old_alias) {
+            sibling = static_cast<uint8_t*>(mmap(
+                nullptr, remap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, old_fd, 0));
+            CHECK(sibling != MAP_FAILED, "old-physical sibling mapped");
+            if (sibling == MAP_FAILED) return 1;
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                reinterpret_cast<uint64_t>(sibling), remap_bytes, old_phys, kCpuRw);
+        }
+        auto original_watch = GuestWriteWatch::create(
+            reinterpret_cast<uint64_t>(original + 8), remap_bytes - 16);
+        CHECK(original_watch && original_watch.query() == GuestWriteWatchQuery::Unchanged,
+              "unaligned original range has a clean watch before middle-page replacement");
+        auto* middle = original + page;
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(middle), page);
+        CHECK(mmap(middle, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, new_fd, 0) == middle,
+              "middle page remapped to a different backing section at the same VA");
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(middle), page, new_phys, kCpuRw);
+        CHECK(!original_watch.rearm(), "original-VA remap cannot rearm an old physical registration");
+        CHECK(original_watch.query() == GuestWriteWatchQuery::Dirty,
+              "failed remap rearm never clears the obsolete registration's dirty state");
+        original_watch.reset();
+        auto replacement_watch = GuestWriteWatch::create(reinterpret_cast<uint64_t>(middle + 8), 16);
+        CHECK(replacement_watch && replacement_watch.query() == GuestWriteWatchQuery::Unchanged,
+              "fresh registration resolves the replacement VA backing");
+        middle[12] = 0x5a;
+        CHECK(replacement_watch.query() == GuestWriteWatchQuery::Dirty,
+              "real write to replacement backing dirties the recreated watch");
+        CHECK(!sibling || sibling[page + 12] == 0,
+              "replacement write does not reach the surviving old physical alias");
+        replacement_watch.reset();
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(original), remap_bytes);
+        munmap(original, remap_bytes);
+        if (sibling) {
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                reinterpret_cast<uint64_t>(sibling), remap_bytes);
+            munmap(sibling, remap_bytes);
+        }
+        close(old_fd);
+        close(new_fd);
+    }
+
+    // Protection changes through another VA invalidate the affected PHYSICAL registration only.
+    // A read-only alias becoming writable must not remain invisible to a retained watch.
+    {
+        int protection_fd = memfd_create("prosper-ww-protection", 0);
+        CHECK(protection_fd >= 0 && ftruncate(protection_fd, static_cast<off_t>(page * 3)) == 0,
+              "protection-transition memfd sized");
+        if (protection_fd < 0) return 1;
+        auto* writable = static_cast<uint8_t*>(mmap(
+            nullptr, page * 3, PROT_READ | PROT_WRITE, MAP_SHARED, protection_fd, 0));
+        auto* readonly = static_cast<uint8_t*>(mmap(
+            nullptr, page * 3, PROT_READ, MAP_SHARED, protection_fd, 0));
+        CHECK(writable != MAP_FAILED && readonly != MAP_FAILED,
+              "writable and read-only aliases mapped");
+        if (writable == MAP_FAILED || readonly == MAP_FAILED) return 1;
+        constexpr uint64_t protection_phys = 0xc20000;
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(writable), page * 3, protection_phys, kCpuRw);
+        prosper::host::guest_write_watch_notify_direct_mapping_added(
+            reinterpret_cast<uint64_t>(readonly), page * 3, protection_phys, 0x1);
+        auto affected = GuestWriteWatch::create(reinterpret_cast<uint64_t>(writable + page), page);
+        auto unaffected = GuestWriteWatch::create(reinterpret_cast<uint64_t>(writable), page);
+        CHECK(affected && unaffected, "affected and disjoint physical ranges watched");
+        CHECK(mprotect(readonly + page, page, PROT_READ | PROT_WRITE) == 0,
+              "middle page of read-only alias becomes writable");
+        prosper::host::guest_write_watch_notify_direct_mapping_protection(
+            reinterpret_cast<uint64_t>(readonly + page), page, kCpuRw);
+        CHECK(!affected.rearm() && affected.query() == GuestWriteWatchQuery::Dirty,
+              "changed sibling-alias protection requires a fresh registration");
+        CHECK(unaffected.rearm() && unaffected.query() == GuestWriteWatchQuery::Unchanged,
+              "partial protection change leaves disjoint physical registration rearmable");
+        affected.reset();
+        affected = GuestWriteWatch::create(reinterpret_cast<uint64_t>(writable + page), page);
+        CHECK(affected && affected.query() == GuestWriteWatchQuery::Unchanged,
+              "sole-owner replacement watch uses current sibling-alias protections");
+        readonly[page + 32] = 0x77;
+        CHECK(writable[page + 32] == 0x77 && affected.query() == GuestWriteWatchQuery::Dirty,
+              "real store through newly writable alias dirties recreated watch");
+        affected.reset();
+        unaffected.reset();
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(writable), page * 3);
+        prosper::host::guest_write_watch_notify_direct_mapping_removed(
+            reinterpret_cast<uint64_t>(readonly), page * 3);
+        munmap(writable, page * 3);
+        munmap(readonly, page * 3);
+        close(protection_fd);
+    }
 
     // N2: a partial re-protect must record ONLY the re-protected sub-range. Re-protect the MIDDLE page of
     // a fresh 3-page mapping read-only; a watch over the FIRST page must still find it writable, arm it,
