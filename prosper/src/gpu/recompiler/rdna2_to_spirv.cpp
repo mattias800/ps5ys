@@ -2911,20 +2911,23 @@ uint32_t fragment_effective_wave_size_for_test(uint32_t requested_wave_size,
 }
 
 uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code, dwords, ins);
     uint32_t packed = 0;
     // One nibble per MRT, MRT0..MRT7. Sized 2 until 2026-08-15, which silently forced
     // `write_mask &= 0` for slots 2..7 at gpu_execute.hpp's EXP.EN gate -- so a shader exporting to
     // MRT2+ had those attachments dropped no matter what CB_TARGET_MASK and CB_SHADER_MASK said.
     std::array<bool, kFragmentColorOutputs> realized{};
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        if (in.fmt != Rdna2Format::EXP || in.exp_target >= realized.size() ||
-            realized[in.exp_target] || in.exp_en == 0)
-            continue;
-        packed |= (in.exp_en & 0xFu) << (in.exp_target * 4u);
-        realized[in.exp_target] = true;
+    // This property needs no retained instructions. Match rdna2_walk's bounded decode and
+    // termination rules without allocating/copying a complete instruction vector on every draw.
+    for (size_t pc = 0; pc < dwords;) {
+        const Rdna2Inst in = rdna2_decode_one(code + pc, dwords - pc);
+        if (in.is_end || in.fmt == Rdna2Format::Unknown) break;
+        if (in.fmt == Rdna2Format::EXP && in.exp_target < realized.size() &&
+            !realized[in.exp_target] && in.exp_en != 0) {
+            packed |= (in.exp_en & 0xFu) << (in.exp_target * 4u);
+            realized[in.exp_target] = true;
+        }
+        if (in.len_dwords == 0) break;
+        pc += in.len_dwords;
     }
     return packed;
 }
@@ -3353,8 +3356,6 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
     VertexPrologInfo result;
     if (!code || !dwords) return result;
 
-    std::vector<Rdna2Inst> instructions;
-    rdna2_walk(code, dwords, instructions);
     const bool prologlog = getenv("PROSPER_PROLOGLOG") != nullptr;
     uint64_t phash = 0xcbf29ce484222325ull;
     if (prologlog)
@@ -3367,7 +3368,13 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
         fprintf(stderr, "[prologlog] hash=%016llx dwords=%zu %s pc=%u fmt=%d\n",
                 (unsigned long long)phash, dwords, what, at ? at->pc : 0u, at ? (int)at->fmt : -1);
     };
-    for (const Rdna2Inst& instruction : instructions) {
+    // Only the prefix before the transfer can belong to a fetch prolog. Track its branch-target
+    // bounds while decoding, so neither the prefix nor the unused shader tail needs a vector.
+    int64_t min_branch_target = 0;
+    int64_t max_branch_target = 0;
+    for (size_t pc = 0; pc < dwords;) {
+        Rdna2Inst instruction = rdna2_decode_one(code + pc, dwords - pc);
+        instruction.pc = static_cast<uint32_t>(pc);
         // A fetch prolog has no architectural output or program termination of its own. Encountering
         // either before the transfer means this is a complete/different shader, not the split ABI.
         if (instruction.is_end || instruction.fmt == Rdna2Format::EXP ||
@@ -3375,38 +3382,36 @@ VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords) {
             prolog_note("BAIL", &instruction);
             return {};
         }
-        if (instruction.fmt != Rdna2Format::SOP1 || instruction.opcode != 0x20)
-            continue;
-
-        // GFX9+ merged-stage fetch prologs receive the continuation PC in reserved s[6:7]. Keeping
-        // this exact pair in the recognizer prevents an arbitrary indirect jump from becoming host
-        // fallthrough merely because a second program happened to be bound.
-        if (instruction.n_src != 1 || instruction.src[0].kind != OperandKind::SGPR ||
-            instruction.src[0].value != 6 || instruction.len_dwords != 1)
-            return {};
-        prolog_note("TRANSFER", &instruction);
-        result.valid = instruction.pc != 0;
-        result.setpc_pc = instruction.pc;
-        result.prefix_dwords = instruction.pc;
-        break;
+        if (instruction.fmt == Rdna2Format::SOP1 && instruction.opcode == 0x20) {
+            // GFX9+ merged-stage fetch prologs receive the continuation PC in reserved s[6:7].
+            // Keep this exact pair: an arbitrary indirect jump must not become host fallthrough.
+            if (instruction.n_src != 1 || instruction.src[0].kind != OperandKind::SGPR ||
+                instruction.src[0].value != 6 || instruction.len_dwords != 1)
+                return {};
+            prolog_note("TRANSFER", &instruction);
+            // Every direct branch must remain inside the retained prefix or land exactly on the
+            // transfer (main pc0 after linking), never in discarded padding/data. The linked body
+            // recompiler performs the remaining structured-CFG validation.
+            if (instruction.pc == 0 || min_branch_target < 0 ||
+                max_branch_target > instruction.pc)
+                return {};
+            result.valid = true;
+            result.setpc_pc = instruction.pc;
+            result.prefix_dwords = instruction.pc;
+            return result;
+        }
+        if (instruction.fmt == Rdna2Format::SOPP &&
+            (instruction.opcode == 0x02 ||
+             (instruction.opcode >= 0x04 && instruction.opcode <= 0x09))) {
+            const int64_t target = static_cast<int64_t>(instruction.pc) + instruction.len_dwords +
+                                   static_cast<int64_t>(instruction.simm16);
+            min_branch_target = std::min(min_branch_target, target);
+            max_branch_target = std::max(max_branch_target, target);
+        }
+        if (instruction.len_dwords == 0) break;
+        pc += instruction.len_dwords;
     }
-    if (!result.valid) return {};
-
-    // Replacing the transfer with fallthrough is valid only when every direct branch in the prolog
-    // remains inside the retained prefix (or lands exactly on the transfer, which becomes main pc0).
-    // A branch into discarded padding/data would otherwise be silently redirected into unrelated
-    // main code. The linked body recompiler performs the remaining structured-CFG validation.
-    for (const Rdna2Inst& instruction : instructions) {
-        if (instruction.pc >= result.setpc_pc) break;
-        if (instruction.fmt != Rdna2Format::SOPP ||
-            (instruction.opcode != 0x02 &&
-             (instruction.opcode < 0x04 || instruction.opcode > 0x09)))
-            continue;
-        const int64_t target = static_cast<int64_t>(instruction.pc) + instruction.len_dwords +
-                               static_cast<int64_t>(instruction.simm16);
-        if (target < 0 || target > result.setpc_pc) return {};
-    }
-    return result;
+    return {};
 }
 
 namespace {

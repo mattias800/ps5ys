@@ -1931,6 +1931,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_vertex_fetch_reject_diagnostic PRIVATE prosper_core)
   add_test(NAME vertex_fetch_reject_diagnostic COMMAND test_vertex_fetch_reject_diagnostic)
 
+  # CPU-only streaming shader properties: exact legacy semantics without per-query vectors.
+  add_executable(test_shader_property_scans tests/gpu/recompiler/test_shader_property_scans.cpp)
+  target_link_libraries(test_shader_property_scans PRIVATE prosper_core)
+  add_test(NAME shader_property_scans COMMAND ${CMAKE_COMMAND} -E env
+           --unset=PROSPER_PROLOGLOG $<TARGET_FILE:test_shader_property_scans>)
+
   add_executable(test_gta5_selected_sbuffer tests/gpu/recompiler/test_gta5_selected_sbuffer.cpp)
   target_link_libraries(test_gta5_selected_sbuffer PRIVATE prosper_core)
   add_test(NAME gta5_selected_sbuffer COMMAND test_gta5_selected_sbuffer)
