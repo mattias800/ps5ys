@@ -25,10 +25,11 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 The intro's largest single cost turned out to be a per-texel conversion loop running on one core out
 of thirty-two — and the helper that spreads exactly this kind of loop across cores was already in the
-same file, used at thirteen other sites, just never applied to these six. Wiring them up halves the
-compute time, and giving the texture staging copy the same treatment takes the intro from 3.4 to
-4.7 fps. Still six times slower than it needs to be, for a reason that is architectural rather than
-a missed optimisation: [#3407](https://github.com/mattias800/prosper/issues/3407).
+same file, used thirteen times elsewhere and once inside this very chain, just never applied to these
+six. Wiring them up halves the compute time, and giving the texture staging copy the same treatment
+takes the intro from 3.6 to 4.7 fps on top of the mapping fix below. Still six times slower than it
+needs to be, for a reason that is architectural rather than a missed optimisation:
+[#3407](https://github.com/mattias800/prosper/issues/3407).
 
 ### Sonic Frontiers got faster, and the GPU was never the problem
 
