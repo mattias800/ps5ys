@@ -21,6 +21,7 @@
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "shared/present/present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "shared/present/present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
+#include "shared/device/vulkan_runtime.hpp"
 #include "hle/sync/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
 #include "host/platform/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/platform/gpu_submit_gate.hpp"     // #3225: drain guest GPU submits before _Exit
@@ -241,7 +242,9 @@ bool create_instance(Vk& vk, SDL_Window* win) {
                exts.end());
 #endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "prosper-app"; app.apiVersion = VK_API_VERSION_1_1;
+    if (!prosper::frontend::require_vulkan_runtime_loader("app")) return false;
+    app.pApplicationName = "prosper-app";
+    app.apiVersion = prosper::frontend::kVulkanRuntimeVersion;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = (uint32_t)exts.size();
@@ -259,6 +262,9 @@ bool pick_device(Vk& vk) {
     if (!n) { fprintf(stderr, "[app] no Vulkan device\n"); return false; }
     std::vector<VkPhysicalDevice> devs(n); vkEnumeratePhysicalDevices(vk.instance, &n, devs.data());
     for (auto d : devs) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(d, &properties);
+        if (!prosper::frontend::vulkan_runtime_version_supported(properties.apiVersion)) continue;
         uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, nullptr);
         std::vector<VkQueueFamilyProperties> q(qn); vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, q.data());
         for (uint32_t i = 0; i < qn; i++) {
@@ -267,7 +273,7 @@ bool pick_device(Vk& vk) {
         }
         if (vk.phys) break;
     }
-    if (!vk.phys) { fprintf(stderr, "[app] no graphics+present queue family\n"); return false; }
+    if (!vk.phys) { fprintf(stderr, "[app] no Vulkan 1.4 device with a graphics+present queue family\n"); return false; }
 
     float pr = 1.0f;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -290,6 +296,7 @@ bool pick_device(Vk& vk) {
 
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(vk.phys, &pp);
     fprintf(stderr, "[app] Vulkan device: %s\n", pp.deviceName);
+    prosper::frontend::log_vulkan_runtime_device("app", vk.phys, pp);
     return true;
 }
 

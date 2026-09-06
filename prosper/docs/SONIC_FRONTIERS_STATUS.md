@@ -8,7 +8,26 @@ own embedded shader source paths (`Library\hedgehog\…`, `Library\needle\…`) 
 
 ## Current rung — gameplay reached, world not rendered
 
-### Intro audio and retained color targets (2026-09-07, #3411 / #3415)
+A committed input route (`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`) takes the title
+from boot to **`GameModeStage` running a Cyber Space stage (`w6d01`)** with real GPU work: the
+guest streams all one hundred `w6d01_trr_s00..s99` terrain sectors plus `w6d01_gedit`, loads
+`ui_gamemodestage*.pac`, streams `sound/cyber_sound/bgm_cyber.awb`, and its submitted draw rate
+rises from **48 draws/flip on the title screen to a sustained 449 draws/flip** in the stage.
+
+The gameplay HUD composites correctly at 3840x2160 — ring counter, the five Red Star Ring slots,
+the boost gauge, and **a stage timer that advances monotonically with the guest's flips**
+(00:52.39 -> 00:56.76 across one 55-sample capture; 01:02.36 -> 01:05.83 across a second run).
+A running stage clock is the discriminator this title offers and a menu cannot fake it: no
+aggregate frame metric was used to make the call. Checked-in capture:
+`assets/screenshots/sonic-frontiers-cyberspace-hud.webp` (direct unmodified `tools/screenshot` frame,
+3840x2160, route arm, stage clock at 00:55.89).
+
+**What is not there is the world.** The 3840x2160 frame is black behind the HUD, because
+**16 of the stage's 32 compute programs never execute** (#2790). See the section below. So the rung is deliberately not
+ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
+between that and a gameplay screenshot.
+
+## Intro audio and retained color targets (2026-09-07, #3411 / #3415)
 
 AudioOut2 now owns a separate float buffer for every port/channel and consumes each submitted grain
 once. The guest shares a scratch address between its MAIN and auxiliary outputs; copying only at
@@ -34,25 +53,6 @@ run; smooth audio is not yet established.
 `mrt_binding` and `texture_sample_render` pass. The latter checks exact CPU-reference pixels for 2D
 and arrayed views of a retained single-layer image, including feedback copies; its Vulkan validation
 messenger was active and reported no errors or warnings.
-
-A committed input route (`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`) takes the title
-from boot to **`GameModeStage` running a Cyber Space stage (`w6d01`)** with real GPU work: the
-guest streams all one hundred `w6d01_trr_s00..s99` terrain sectors plus `w6d01_gedit`, loads
-`ui_gamemodestage*.pac`, streams `sound/cyber_sound/bgm_cyber.awb`, and its submitted draw rate
-rises from **48 draws/flip on the title screen to a sustained 449 draws/flip** in the stage.
-
-The gameplay HUD composites correctly at 3840x2160 — ring counter, the five Red Star Ring slots,
-the boost gauge, and **a stage timer that advances monotonically with the guest's flips**
-(00:52.39 -> 00:56.76 across one 55-sample capture; 01:02.36 -> 01:05.83 across a second run).
-A running stage clock is the discriminator this title offers and a menu cannot fake it: no
-aggregate frame metric was used to make the call. Checked-in capture:
-`assets/screenshots/sonic-frontiers-cyberspace-hud.webp` (direct unmodified `tools/screenshot` frame,
-3840x2160, route arm, stage clock at 00:55.89).
-
-**What is not there is the world.** The 3840x2160 frame is black behind the HUD, because
-**16 of the stage's 32 compute programs never execute** (#2790). See the section below. So the rung is deliberately not
-ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
-between that and a gameplay screenshot.
 
 ## What stood between the title screen and gameplay: a twelve-page boot notice queue
 

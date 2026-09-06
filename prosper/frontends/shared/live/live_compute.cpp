@@ -3079,8 +3079,9 @@ struct VulkanComputeContext {
             min_native_subgroup_size = max_native_subgroup_size = 0;
             pipeline_cache = VK_NULL_HANDLE;
         }
+        if (!require_vulkan_runtime_loader("compute")) return false;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.apiVersion = VK_API_VERSION_1_1;
+        app.apiVersion = kVulkanRuntimeVersion;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.pApplicationInfo = &app;
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
@@ -3093,10 +3094,14 @@ struct VulkanComputeContext {
         const auto selection = select_vulkan_device(devices, VK_QUEUE_COMPUTE_BIT);
         physical = selection.device;
         queue_family = selection.queue_family;
-        if (!physical || queue_family == UINT32_MAX) return false;
+        if (!physical || queue_family == UINT32_MAX) {
+            std::fprintf(stderr, "[compute] no Vulkan 1.4 device with a compute queue and robustBufferAccess\n");
+            return false;
+        }
         std::fprintf(stderr, "[compute] Vulkan device: %s (%s)\n",
                      selection.properties.deviceName,
                      vulkan_device_type_name(selection.properties.deviceType));
+        log_vulkan_runtime_device("compute", physical, selection.properties);
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -3132,81 +3137,33 @@ struct VulkanComputeContext {
         // device set and emit indexed-array SPIR-V against a device that cannot execute it — silent
         // undefined behaviour rather than a clean failure. Successful contracts are fixed storage-
         // buffer arrays, so only their non-uniform indexing feature is requested.
-        VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-        bool di_ext_advertised = false;
-        { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
-          std::vector<VkExtensionProperties> de(ne);
-          vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
-          for (auto& e : de) {
-              if (std::strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) continue;
-              di_ext_advertised = true;
-              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-              f2.pNext = &di_features;
-              vkGetPhysicalDeviceFeatures2(physical, &f2);
-              const bool have_ssbo_arrays =
-                  di_features.shaderStorageBufferArrayNonUniformIndexing;
-              if (have_ssbo_arrays) {
-                  VkPhysicalDeviceDescriptorIndexingFeaturesEXT want{
-                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-                  want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
-                  di_features = want;
-                  di_features.pNext = const_cast<void*>(dci.pNext);
-                  dci.pNext = &di_features;
-                  dev_exts.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
-                  descriptor_indexing_support = true;
-                  std::fprintf(stderr, "[compute] descriptor indexing ENABLED (own device)\n");
-              } else {
-                  std::fprintf(stderr,
-                               "[compute] VK_EXT_descriptor_indexing lacks "
-                               "shaderStorageBufferArrayNonUniformIndexing\n");
-              }
-              break;
-          } }
-        // The third case, and the only one that was silent: the extension is not advertised at all, so
-        // the loop above never enters its body and nothing above prints. "Absent" and "the scan never
-        // ran" would then look identical in a log -- the same ambiguity that let the adopt path claim an
-        // inheritance nobody could contradict. Report it so every outcome of this decision is visible.
-        // Guarded on `di_ext_advertised`, NOT on `descriptor_indexing_support`: the feature flag is also
-        // false in the present-but-incomplete case, which already printed its own itemised line, and this
-        // message would then contradict it with "not advertised" about a device that advertised it.
-        if (!di_ext_advertised)
-            std::fprintf(stderr, "[compute] descriptor indexing unavailable: "
-                                 "VK_EXT_descriptor_indexing not advertised by this device\n");
-        // Live raw translation chooses its qword-atomic config from SharedVulkanContext before this
-        // lazy private-device path can run, so private discovery deliberately does not advertise an
-        // admission capability. Still enable the feature here when available: this path can execute
-        // already-compiled/captured modules whose config was established by their replay owner.
+        // Descriptor indexing and shader-buffer int64 atomics are core in 1.2. The runtime
+        // requires 1.4, so an absent promoted extension name must not disable either feature.
+        VkPhysicalDeviceDescriptorIndexingFeatures di_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
-        bool atomic_int64_ext_advertised = false;
-        bool private_storage_buffer_int64_atomics = false;
-        { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
-          std::vector<VkExtensionProperties> de(ne);
-          vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
-          for (const auto& e : de) {
-              if (std::strcmp(e.extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))
-                  continue;
-              atomic_int64_ext_advertised = true;
-              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-              f2.pNext = &atomic_int64_features;
-              vkGetPhysicalDeviceFeatures2(physical, &f2);
-              if (supported.shaderInt64 &&
-                  atomic_int64_features.shaderBufferInt64Atomics) {
-                  VkPhysicalDeviceShaderAtomicInt64Features want{
-                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
-                  want.shaderBufferInt64Atomics = VK_TRUE;
-                  atomic_int64_features = want;
-                  atomic_int64_features.pNext = const_cast<void*>(dci.pNext);
-                  dci.pNext = &atomic_int64_features;
-                  dev_exts.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
-                  private_storage_buffer_int64_atomics = true;
-              }
-              break;
-          } }
-        std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s (own device%s)\n",
-                     private_storage_buffer_int64_atomics ? "ENABLED" : "unavailable",
-                     atomic_int64_ext_advertised ? "" : ", extension not advertised");
+        VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features2.pNext = &di_features;
+        di_features.pNext = &atomic_int64_features;
+        vkGetPhysicalDeviceFeatures2(physical, &features2);
+        descriptor_indexing_support = di_features.shaderStorageBufferArrayNonUniformIndexing;
+        const bool private_storage_buffer_int64_atomics =
+            supported.shaderInt64 && atomic_int64_features.shaderBufferInt64Atomics;
+        // Only request the bits used by this backend, not every bit returned by the query.
+        di_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+        di_features.shaderStorageBufferArrayNonUniformIndexing = descriptor_indexing_support;
+        atomic_int64_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+        atomic_int64_features.shaderBufferInt64Atomics = private_storage_buffer_int64_atomics;
+        di_features.pNext = &atomic_int64_features;
+        dci.pNext = &di_features;
+        std::fprintf(stderr, "[compute] descriptor indexing %s (own device, core feature)\n",
+                     descriptor_indexing_support ? "ENABLED" : "unavailable");
+        // Private discovery does not publish an admission capability: raw live translation
+        // chooses its qword-atomic config before this lazy initialization can run. This still
+        // allows replaying modules compiled against a known feature contract.
+        std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s (own device, core feature)\n",
+                     private_storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
@@ -3215,12 +3172,6 @@ struct VulkanComputeContext {
           for (auto& e : de) if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset")) {
               dev_exts.push_back("VK_KHR_portability_subset"); break; } }
 #endif
-        // Assigned OUTSIDE the Apple guard. Before stage 1 the only extension this path ever requested
-        // was VK_KHR_portability_subset, so the assignment lived inside `#ifdef __APPLE__` and every
-        // other platform passed a zero-length list. Leaving it there would have silently dropped the
-        // descriptor-indexing extension on Linux and Windows -- the pNext feature struct would be sent
-        // without its extension enabled, which is exactly the shape that produces a validation error
-        // far from its cause.
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;

@@ -433,18 +433,9 @@ inline bool backend_storage_image_numeric_contract_valid(const FrameResource& re
 // The first exact guest-MSAA contract is intentionally narrow. Ordinary resources retain their
 // historical implicit byte-span behavior; a 2D_MSAA plane array must prove all four complete R32F
 // planes are readable before any Vulkan object or memcpy is attempted.
-// A pragmatic ceiling, NOT a portability guarantee -- an earlier revision of this comment claimed
-// 2048 was "Vulkan's guaranteed minimum for maxImageArrayLayers" and that is wrong. The Core
-// Required Limits table gives **256**; 2048 is the Roadmap 2022 / Vulkan 1.4 figure, and this
-// backend requests VK_API_VERSION_1_1 (see vkCreateInstance below), so the guarantee that actually
-// applies here is 256. This box's RADV reports 8192.
-//
-// So what this bound does is keep an absurd layer count away from vkCreateImage, whose result the
-// upload path discards (#3045) -- an over-large arrayLayers yields VK_NULL_HANDLE and is passed
-// straight to vkGetImageMemoryRequirements. It does NOT prove creatability on an arbitrary device;
-// a device reporting the Core minimum of 256 can still reject a 512-layer image, and it will do so
-// through that same unchecked path until #3045 lands. Querying the real limit is the correct fix
-// and belongs with #3045, since this predicate has no device handle.
+// Vulkan 1.4 guarantees at least 2048 maxImageArrayLayers. Keep this admission ceiling even
+// on devices supporting more layers. It does not prove format/usage-specific creatability or
+// allocation success; checking every upload's VkResult is still owed by #3045.
 inline constexpr uint32_t kBackendMaxArrayLayers = 2048u;
 
 // A guest 2D_ARRAY is the same shape as the MSAA plane array with a different provenance: N
@@ -1102,7 +1093,9 @@ struct RenderVkCtx {
 inline const RenderVkCtx& render_vk_ctx() {
     static RenderVkCtx c = [] {
         RenderVkCtx r;
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
+        if (!prosper::frontend::require_vulkan_runtime_loader("render")) return r;
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = prosper::frontend::kVulkanRuntimeVersion;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
         // macOS: MoltenVK is linked directly, so VK_KHR_portability_enumeration is neither needed nor
         // accepted here (see prosper-app main.cpp). Only the device-level portability_subset matters.
@@ -1284,10 +1277,14 @@ inline const RenderVkCtx& render_vk_ctx() {
         const auto selection = prosper::frontend::select_vulkan_device(devs, VK_QUEUE_GRAPHICS_BIT);
         r.phys = selection.device;
         r.qfi = selection.queue_family;
-        if (!r.phys || r.qfi == UINT32_MAX) return r;
+        if (!r.phys || r.qfi == UINT32_MAX) {
+            std::fprintf(stderr, "[render] no Vulkan 1.4 device with a graphics queue and robustBufferAccess\n");
+            return r;
+        }
         std::fprintf(stderr, "[render] Vulkan device: %s (%s)\n",
                      selection.properties.deviceName,
                      prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
+        prosper::frontend::log_vulkan_runtime_device("render", r.phys, selection.properties);
         // Present unification (#1270): if the graphics family exposes a second queue, dedicate index 1
         // to prosper-app's present so the app's blit/present submits never contend the render queue's
         // external-synchronization. On a single-queue family (RADV STRIX_HALO is queueCount==1) the app
@@ -1356,11 +1353,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         feats.pipelineStatisticsQuery = supported.pipelineStatisticsQuery;
         r.pipeline_stats_enabled = supported.pipelineStatisticsQuery;
         if (supported.occlusionQueryPrecise) { feats.occlusionQueryPrecise = VK_TRUE; r.occlusion_precise = true; }
-        // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
-        // Device extensions accumulate into a vector so the (optional) image-robustness and (macOS)
-        // portability-subset extensions coexist.
+        // OpImageRead OOB must return zero (#131); enable robustImageAccess when supported.
+        // Only features not promoted to core still require extension names below.
         std::vector<const char*> dev_exts;
-        VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
+        VkPhysicalDeviceImageRobustnessFeatures irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES};
         VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_properties{
@@ -1369,101 +1365,103 @@ inline const RenderVkCtx& render_vk_ctx() {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         VkPhysicalDeviceTransformFeedbackFeaturesEXT tf_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
-        VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+        VkPhysicalDeviceDescriptorIndexingFeatures di_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+        // These features are core in Vulkan 1.2/1.3. Query the feature bits directly;
+        // promoted extensions need not still be advertised by a Vulkan 1.4 device.
+        {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+            if (irf.robustImageAccess) {
+                irf.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &irf;
+            }
+        }
+
+        // Runtime-selected storage buffers use bounded fixed arrays. Request only the one
+        // descriptor-indexing feature their non-uniform access chains require.
+        {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &di_features;
+            vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+            const bool have_ssbo_arrays =
+                di_features.shaderStorageBufferArrayNonUniformIndexing;
+            if (have_ssbo_arrays) {
+                // Request exactly the feature in use, not the whole struct as queried. Enabling a feature
+                // the design does not use widens the driver contract for no benefit, and a
+                // later reader cannot tell which ones are load-bearing.
+                VkPhysicalDeviceDescriptorIndexingFeatures want{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+                want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+                di_features = want;
+                di_features.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &di_features;
+                r.descriptor_indexing = true;
+                // Log the SUCCESS too, not only the shortfall. A diagnostic that fires only on
+                // failure makes the working case silent and therefore indistinguishable from code
+                // that never ran -- which is the ambiguity that has cost this project several false
+                // zeros today alone. This line is the lever check for stage 1: it is the only way
+                // to confirm the capability was actually acquired rather than merely compiled.
+                if (getenv("PROSPER_GFXLOG"))
+                    fprintf(stderr, "[vk] descriptor indexing ENABLED "
+                                    "(nonUniform ssbo)\n");
+            } else if (getenv("PROSPER_GFXLOG")) {
+                // Report the SHORTFALL, not merely "unavailable": which feature is missing decides
+                // whether a fallback is possible at all, and a bare "not supported" would send the
+                // next reader to the extension list when the extension is present.
+                fprintf(stderr,
+                        "[vk] descriptor indexing lacks "
+                        "shaderStorageBufferArrayNonUniformIndexing\n");
+            }
+        }
+
+        {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &atomic_int64_features;
+            vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+            if (supported.shaderInt64 &&
+                atomic_int64_features.shaderBufferInt64Atomics) {
+                VkPhysicalDeviceShaderAtomicInt64Features want{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+                want.shaderBufferInt64Atomics = VK_TRUE;
+                atomic_int64_features = want;
+                atomic_int64_features.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &atomic_int64_features;
+                r.storage_buffer_int64_atomics = true;
+            }
+        }
+
+        {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &subgroup_features;
+            vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+            if (subgroup_features.subgroupSizeControl) {
+                VkPhysicalDeviceProperties2 p2{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                p2.pNext = &subgroup_core_properties;
+                subgroup_core_properties.pNext = &subgroup_properties;
+                vkGetPhysicalDeviceProperties2(r.phys, &p2);
+                subgroup_features.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &subgroup_features;
+                r.subgroup_size_control = true;
+                r.compute_full_subgroups = subgroup_features.computeFullSubgroups;
+                r.min_subgroup_size = subgroup_properties.minSubgroupSize;
+                r.max_subgroup_size = subgroup_properties.maxSubgroupSize;
+                r.max_compute_workgroup_subgroups =
+                    subgroup_properties.maxComputeWorkgroupSubgroups;
+                r.required_subgroup_size_stages =
+                    subgroup_properties.requiredSubgroupSizeStages;
+                r.subgroup_stages = subgroup_core_properties.supportedStages;
+                r.subgroup_operations = subgroup_core_properties.supportedOperations;
+            }
+        }
+
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
           for (uint32_t i = 0; i < ne; i++) {
-              if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
-                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-                  f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  if (irf.robustImageAccess) {
-                      irf.pNext = const_cast<void*>(dci.pNext);
-                      dci.pNext = &irf;
-                      dev_exts.push_back("VK_EXT_image_robustness");
-                  }
-              }
-              if (!strcmp(de[i].extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
-                  // Runtime-selected storage buffers use bounded fixed arrays. Request only the one
-                  // descriptor-indexing feature their non-uniform access chains require.
-                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-                  f2.pNext = &di_features;
-                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  const bool have_ssbo_arrays =
-                      di_features.shaderStorageBufferArrayNonUniformIndexing;
-                  if (have_ssbo_arrays) {
-                      // Request exactly the feature in use, not the whole struct as queried. Enabling a feature
-                      // the design does not use widens the driver contract for no benefit, and a
-                      // later reader cannot tell which ones are load-bearing.
-                      VkPhysicalDeviceDescriptorIndexingFeaturesEXT want{
-                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-                      want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
-                      di_features = want;
-                      di_features.pNext = const_cast<void*>(dci.pNext);
-                      dci.pNext = &di_features;
-                      dev_exts.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
-                      r.descriptor_indexing = true;
-                      // Log the SUCCESS too, not only the shortfall. A diagnostic that fires only on
-                      // failure makes the working case silent and therefore indistinguishable from code
-                      // that never ran -- which is the ambiguity that has cost this project several false
-                      // zeros today alone. This line is the lever check for stage 1: it is the only way
-                      // to confirm the capability was actually acquired rather than merely compiled.
-                      if (getenv("PROSPER_GFXLOG"))
-                          fprintf(stderr, "[vk] descriptor indexing ENABLED "
-                                          "(nonUniform ssbo)\n");
-                  } else if (getenv("PROSPER_GFXLOG")) {
-                      // Report the SHORTFALL, not merely "unavailable": which feature is missing decides
-                      // whether a fallback is possible at all, and a bare "not supported" would send the
-                      // next reader to the extension list when the extension is present.
-                      fprintf(stderr,
-                              "[vk] VK_EXT_descriptor_indexing lacks "
-                              "shaderStorageBufferArrayNonUniformIndexing\n");
-                  }
-              }
-              if (!strcmp(de[i].extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
-                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-                  f2.pNext = &atomic_int64_features;
-                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  if (supported.shaderInt64 &&
-                      atomic_int64_features.shaderBufferInt64Atomics) {
-                      VkPhysicalDeviceShaderAtomicInt64Features want{
-                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
-                      want.shaderBufferInt64Atomics = VK_TRUE;
-                      atomic_int64_features = want;
-                      atomic_int64_features.pNext = const_cast<void*>(dci.pNext);
-                      dci.pNext = &atomic_int64_features;
-                      dev_exts.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
-                      r.storage_buffer_int64_atomics = true;
-                  }
-              }
-              if (!strcmp(de[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
-                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-                  f2.pNext = &subgroup_features;
-                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  if (subgroup_features.subgroupSizeControl) {
-                      VkPhysicalDeviceProperties2 p2{
-                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-                      p2.pNext = &subgroup_core_properties;
-                      subgroup_core_properties.pNext = &subgroup_properties;
-                      vkGetPhysicalDeviceProperties2(r.phys, &p2);
-                      subgroup_features.pNext = const_cast<void*>(dci.pNext);
-                      dci.pNext = &subgroup_features;
-                      dev_exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
-                      r.subgroup_size_control = true;
-                      r.compute_full_subgroups = subgroup_features.computeFullSubgroups;
-                      r.min_subgroup_size = subgroup_properties.minSubgroupSize;
-                      r.max_subgroup_size = subgroup_properties.maxSubgroupSize;
-                      r.max_compute_workgroup_subgroups =
-                          subgroup_properties.maxComputeWorkgroupSubgroups;
-                      r.required_subgroup_size_stages =
-                          subgroup_properties.requiredSubgroupSizeStages;
-                      r.subgroup_stages = subgroup_core_properties.supportedStages;
-                      r.subgroup_operations = subgroup_core_properties.supportedOperations;
-                  }
-              }
               // Geometry-probe (PROSPER_GEOM_PROBE): capture the last pre-rasterization stage. Enable
               // only the base transformFeedback feature; separate geometry streams are not needed.
               if (!strcmp(de[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {

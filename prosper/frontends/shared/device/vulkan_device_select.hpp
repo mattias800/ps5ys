@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include "vulkan_runtime.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -30,13 +31,16 @@ static_assert(vulkan_device_type_rank(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) >
               vulkan_device_type_rank(VK_PHYSICAL_DEVICE_TYPE_CPU));
 
 // Vulkan does not promise that physical devices are enumerated in performance order. Prefer a
-// hardware GPU when one supports the queue and robustness contract, while retaining llvmpipe and
-// other CPU implementations as a headless fallback.
+// hardware GPU when one supports the runtime version, queue and robustness contract, retaining
+// llvmpipe and other CPU implementations as a headless fallback.
 inline VulkanDeviceSelection select_vulkan_device(
     const std::vector<VkPhysicalDevice>& devices, VkQueueFlags required_queue_flags) {
     VulkanDeviceSelection best;
     int best_rank = -1;
     for (VkPhysicalDevice device : devices) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(device, &properties);
+        if (!vulkan_runtime_version_supported(properties.apiVersion)) continue;
         VkPhysicalDeviceFeatures features{};
         vkGetPhysicalDeviceFeatures(device, &features);
         if (!features.robustBufferAccess) continue;
@@ -54,8 +58,6 @@ inline VulkanDeviceSelection select_vulkan_device(
         }
         if (queue_family == UINT32_MAX) continue;
 
-        VkPhysicalDeviceProperties properties{};
-        vkGetPhysicalDeviceProperties(device, &properties);
         const int rank = vulkan_device_type_rank(properties.deviceType);
         if (rank > best_rank) {
             best = {device, queue_family, properties};

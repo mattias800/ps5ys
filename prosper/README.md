@@ -120,6 +120,12 @@ prosper/
 ```
 
 ## Build
+
+The live Vulkan renderer, compute backend, and windowed frontend require Vulkan 1.4 headers,
+loader, and a Vulkan 1.4 device. Optional features are checked individually; no experimental driver
+flags are required. Older MoltenVK devices no longer satisfy the runtime requirement. See
+[Vulkan runtime](docs/VULKAN_RUNTIME.md) for capability policy and modernization measurements.
+
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
