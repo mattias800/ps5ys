@@ -12,6 +12,12 @@ Windows devices must satisfy the same version and feature checks. This change wa
 RADV, not certified on NVIDIA or Windows. MoltenVK devices exposing less than 1.4 are no longer
 accepted, as permitted by the owner's platform-priority decision in #3414.
 
+Linux CI installs pinned Khronos 1.4.341 headers and loader through
+`.github/actions/setup-vulkan`, with archive checksums and a cache keyed by distribution version.
+Ubuntu 24.04's system headers/loader predate this runtime floor. The jobs retain their distribution
+Mesa ICD and validation layer; updating the loader does not substitute a different GPU driver or
+remove the existing validation baseline.
+
 ## Features already consumed
 
 Graphics now queries descriptor indexing, buffer int64 atomics, robust image access, and subgroup

@@ -1,0 +1,58 @@
+name: Vulkan 1.4 toolchain
+description: Build pinned Khronos headers and loader while retaining the runner's Mesa driver and validation layer.
+runs:
+  using: composite
+  steps:
+    - name: Identify the build distribution
+      id: host
+      shell: bash
+      run: |
+        . /etc/os-release
+        printf 'distribution=%s-%s\n' "$ID" "$VERSION_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Cache headers and loader
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/prosper-vulkan
+        key: vulkan-1.4.341-${{ runner.os }}-${{ runner.arch }}-${{ steps.host.outputs.distribution }}-1
+
+    - name: Build headers and loader
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        sudo apt-get install -y libx11-dev libxcb1-dev libxrandr-dev libwayland-dev
+        vulkan_root="$RUNNER_TEMP/prosper-vulkan-build"
+        vulkan_prefix="$RUNNER_TEMP/prosper-vulkan"
+        mkdir -p "$vulkan_root/tmpdir"
+        export TMPDIR="$vulkan_root/tmpdir"
+        cd "$vulkan_root"
+        curl --fail --location --retry 3 \
+          https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.4.341 \
+          --output headers.tar.gz
+        curl --fail --location --retry 3 \
+          https://codeload.github.com/KhronosGroup/Vulkan-Loader/tar.gz/refs/tags/v1.4.341 \
+          --output loader.tar.gz
+        printf '%s\n' \
+          '8876aad926b2e72bdefddc34885472d5332e2d20aa3ed57313466f0bc982cf3f  headers.tar.gz' \
+          '9a8c6f1aace4a03641429a09bc823073f2375abf2d62ac5a4d38c46e732b2d85  loader.tar.gz' \
+          | sha256sum --check
+        tar -xzf headers.tar.gz
+        tar -xzf loader.tar.gz
+        cmake -S Vulkan-Headers-1.4.341 -B headers-build -G Ninja \
+          -DCMAKE_INSTALL_PREFIX="$vulkan_prefix"
+        cmake --install headers-build
+        cmake -S Vulkan-Loader-1.4.341 -B loader-build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$vulkan_prefix" \
+          -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$vulkan_prefix" \
+          -DBUILD_TESTS=OFF -DUPDATE_DEPS=OFF
+        cmake --build loader-build --parallel 2
+        cmake --install loader-build
+
+    - name: Select the Vulkan toolchain
+      shell: bash
+      run: |
+        vulkan_prefix="$RUNNER_TEMP/prosper-vulkan"
+        printf 'VULKAN_SDK=%s\n' "$vulkan_prefix" >> "$GITHUB_ENV"
+        printf 'LD_LIBRARY_PATH=%s/lib%s\n' "$vulkan_prefix" \
+          "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
