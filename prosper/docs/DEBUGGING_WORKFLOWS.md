@@ -42,6 +42,7 @@ It is not a global GPU utilization meter or a lock. Check again before each meas
 | Question | First evidence | Next step |
 | --- | --- | --- |
 | Black world, wrong colors, missing geometry | Normal screenshot plus F9 seeded bundle from the failing phase | Replay, inspect the affected submit's descriptors/resources, isolate draws |
+| A specific pixel is the wrong colour | An `.rdc` of the failing frame, then `tools/pixel_history/` | It names which of the four causes applies; go to the file that cause implicates |
 | Slow gameplay | Windowed app at native resolution, F8 report, calibrated GPU utilization | CPU samples for active work; wait tools for blocked threads |
 | Stalled loading or intermittent hang | Repeated guest stacks plus progression evidence | Identify HLE wait/caller; inspect the producer or lock holder |
 | Memory growth or corruption | Host allocation profile plus guest allocation/caller logs | Isolate the allocator, then watch the suspect write or run host tests under sanitizers |
@@ -65,6 +66,21 @@ environment. Set `bundle` from the completed **bundle written** log line. The 60
 and submit 0 above illustrate syntax; choose the phase and submit from actual evidence.
 Keep the capture's screenshot beside its bundle. A logo, movie or pre-rendered loading image
 does not establish that the 3D world rendered.
+
+**Before censusing draws to explain a black region, ask the pixel.** A draw census answers "what
+was submitted", which is a different question from "what happened here", and inferring the second
+from the first is what has produced retracted issues in this project:
+
+```bash
+renderdoccmd capture -w build-linux/prosper-app --dump "$dump_dir"   # or attach to a live run
+python3 tools/pixel_history/pixel_history.py "$run_dir/frame.rdc" --output "$run_dir/pixhist"
+```
+
+It reports one of `NOTHING_DREW`, `ALL_REJECTED` (naming the test that rejected), `SHADER_WROTE_BLACK`
+or `STORE_LOST_IT`, with the per-event detail behind it, and defaults to the brightest pixel rather
+than the centre. On a driver you have not used it on before, run `--expect-control` against
+`pixel_history_control` first; see [its AGENTS.md](../tools/pixel_history/AGENTS.md) for why that is
+not ceremony.
 
 Replay can expose translation defects, but it does not reproduce every live ownership/race defect.
 Repeat before treating an output hash as an oracle; the [determinism tools](../tools/determinism/AGENTS.md)

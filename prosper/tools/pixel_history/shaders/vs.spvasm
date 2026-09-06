@@ -1,0 +1,61 @@
+; vs.spvasm — vertex stage of the pixel-history known-answer control.
+;
+; Emits the standard gl_VertexIndex full-screen triangle, so the control needs no
+; vertex buffer, no index buffer and no descriptor set: every draw covers the whole
+; target and the ONLY things that vary between draws are push constants and scissor.
+; That is deliberate — each draw must differ in exactly one property, or the control
+; cannot attribute a rejection to the property it is testing.
+;
+;   idx=0 -> (-1,-1)   idx=1 -> (3,-1)   idx=2 -> (-1,3)
+;
+; Depth comes from push constant member 1, so one pipeline produces draws that pass
+; and draws that fail the depth test.
+;
+; Assemble: spirv-as --target-env vulkan1.0 shaders/vs.spvasm -o vs.spv
+
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %gl_VertexIndex %gl_Position
+               OpDecorate %gl_VertexIndex BuiltIn VertexIndex
+               OpDecorate %gl_Position BuiltIn Position
+               OpDecorate %pcb Block
+               OpMemberDecorate %pcb 0 Offset 0
+               OpMemberDecorate %pcb 1 Offset 16
+               OpMemberDecorate %pcb 2 Offset 20
+       %void = OpTypeVoid
+        %fnt = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+      %fvec4 = OpTypeVector %float 4
+        %pcb = OpTypeStruct %fvec4 %float %uint
+   %ptr_pcb  = OpTypePointer PushConstant %pcb
+   %ptr_pc_f = OpTypePointer PushConstant %float
+%ptr_in_int  = OpTypePointer Input %int
+%ptr_out_f4  = OpTypePointer Output %fvec4
+         %pc = OpVariable %ptr_pcb PushConstant
+%gl_VertexIndex = OpVariable %ptr_in_int Input
+%gl_Position = OpVariable %ptr_out_f4 Output
+        %i_1 = OpConstant %int 1
+        %i_2 = OpConstant %int 2
+        %f_1 = OpConstant %float 1
+        %f_2 = OpConstant %float 2
+
+       %main = OpFunction %void None %fnt
+      %entry = OpLabel
+        %idx = OpLoad %int %gl_VertexIndex
+         %sh = OpShiftLeftLogical %int %idx %i_1
+         %ax = OpBitwiseAnd %int %sh %i_2
+         %ay = OpBitwiseAnd %int %idx %i_2
+        %axf = OpConvertSToF %float %ax
+        %ayf = OpConvertSToF %float %ay
+        %x2  = OpFMul %float %axf %f_2
+        %x   = OpFSub %float %x2 %f_1
+        %y2  = OpFMul %float %ayf %f_2
+        %y   = OpFSub %float %y2 %f_1
+      %dptr  = OpAccessChain %ptr_pc_f %pc %i_1
+         %d  = OpLoad %float %dptr
+       %pos  = OpCompositeConstruct %fvec4 %x %y %d %f_1
+               OpStore %gl_Position %pos
+               OpReturn
+               OpFunctionEnd

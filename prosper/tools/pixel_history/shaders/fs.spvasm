@@ -1,0 +1,54 @@
+; fs.spvasm — fragment stage of the pixel-history known-answer control.
+;
+; Two behaviours selected by push constant member 2:
+;   0 -> write push constant member 0 as the colour  (the draw PASSES)
+;   1 -> OpKill                                      (the draw is SHADER-DISCARDED)
+;
+; The discard arm exists so the control can prove the tool distinguishes "a fragment
+; reached this pixel and the shader threw it away" from "no fragment ever arrived" --
+; the two produce an identical final image and mean completely different things.
+;
+; Assemble: spirv-as --target-env vulkan1.0 shaders/fs.spvasm -o fs.spv
+
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out_color
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out_color Location 0
+               OpDecorate %pcb Block
+               OpMemberDecorate %pcb 0 Offset 0
+               OpMemberDecorate %pcb 1 Offset 16
+               OpMemberDecorate %pcb 2 Offset 20
+       %void = OpTypeVoid
+        %fnt = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+      %fvec4 = OpTypeVector %float 4
+        %pcb = OpTypeStruct %fvec4 %float %uint
+   %ptr_pcb  = OpTypePointer PushConstant %pcb
+   %ptr_pc_u = OpTypePointer PushConstant %uint
+  %ptr_pc_f4 = OpTypePointer PushConstant %fvec4
+%ptr_out_f4  = OpTypePointer Output %fvec4
+         %pc = OpVariable %ptr_pcb PushConstant
+  %out_color = OpVariable %ptr_out_f4 Output
+        %i_0 = OpConstant %int 0
+        %i_2 = OpConstant %int 2
+        %u_0 = OpConstant %uint 0
+
+       %main = OpFunction %void None %fnt
+      %entry = OpLabel
+      %kptr  = OpAccessChain %ptr_pc_u %pc %i_2
+         %kv = OpLoad %uint %kptr
+       %cond = OpINotEqual %bool %kv %u_0
+               OpSelectionMerge %cont None
+               OpBranchConditional %cond %kill %cont
+       %kill = OpLabel
+               OpKill
+       %cont = OpLabel
+      %cptr  = OpAccessChain %ptr_pc_f4 %pc %i_0
+         %cv = OpLoad %fvec4 %cptr
+               OpStore %out_color %cv
+               OpReturn
+               OpFunctionEnd

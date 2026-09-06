@@ -61,6 +61,12 @@ endif()
 if(TARGET Vulkan::Vulkan)
   add_executable(index_fetch_probe tools/index_fetch_probe/probe.c)
   target_link_libraries(index_fetch_probe PRIVATE Vulkan::Vulkan)
+  # pixel_history_control: the known-answer construction that pixel_history.py is validated
+  # against (see tools/pixel_history/AGENTS.md). Built here without the capture bracket so
+  # its SELF-check -- "did my five arms render as designed?" -- runs with no RenderDoc at
+  # all. The capture build is opt-in in tools/doctor/CMakeLists.txt.
+  add_executable(pixel_history_control tools/pixel_history/control.c)
+  target_link_libraries(pixel_history_control PRIVATE Vulkan::Vulkan)
 endif()
 
 # --- third-party: LibAtrac9 (MIT, vendored) - ATRAC9 audio decode -------------------------
@@ -142,6 +148,12 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME diagnostic_doctor
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/doctor/test_doctor.py")
+  # The verdict logic only. The replay half needs RenderDoc and a GPU and cannot run here,
+  # which is exactly why the shader-output suppression was lifted into a pure function that
+  # this can reach -- see the comment on suppress_shader_output().
+  add_test(NAME pixel_history
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/pixel_history/test_pixel_history.py")
   # self_dump --import-slots reads DT_JMPREL/DT_RELA to answer "which GOT slot does this Sony import
   # land in" (#1625). The fixtures are PS5-shaped ELFs written byte by byte in the test, so they are
   # an independent statement of the relocation layout rather than anything self_dump produced, and

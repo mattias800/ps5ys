@@ -123,8 +123,12 @@ renders far slower. The span closes on a guest present, and the log says which o
 embeds bindings in `qrenderdoc`; `qrenderdoc --python` with the offscreen Qt platform can run
 replay scripts without entering the UI event loop. The [verified control and wrapper](DEBUGGING_WORKFLOWS.md#renderdoc-prove-capture-replay-and-data-inspection)
 capture five indexed draws, replay them, check exact SSBO contents and export a render target.
-Pixel history and shader debugging still need their own capability checks; this control does not
-certify them. `convert` also exports `xml` or `chrome.json` API events, but those event durations
+**Pixel history is now checked and works here**: RenderDoc 1.45 on RADV/STRIX_HALO reports
+`APIProperties.pixelHistory = True`, and `tools/pixel_history/` validates the whole read against a
+construction whose answer is known in advance — a pass, a depth failure, a scissor rejection, a
+shader discard and a final pass, all at one named pixel. `APIProperties.shaderDebugging` also reports
+`True` on the same replay, but nothing has exercised it yet, so treat that as an unverified flag
+rather than a capability this project has used. `convert` also exports `xml` or `chrome.json` API events, but those event durations
 are not hardware GPU execution timings.
 
 ## `radeontop` — the 60-second "is this even GPU-bound?" triage
