@@ -626,6 +626,7 @@ struct Registration {
     std::vector<RegistrationPage> pages;
     uint64_t begin = 0, end = 0;
     bool gpu_dirty = false;
+    bool mapping_valid = true;
 };
 
 struct DmemTracePage {
@@ -847,6 +848,15 @@ void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t p
 // so freeing one here would dangle a live Registration's raw pointer. A page that loses its last alias
 // just lingers, disarmed and Dirty, until its owning registration resets. Called with the lock held.
 void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool remove_topology) {
+    // A registration belongs to its requested VA range, not merely to the physical pages that
+    // happened to back it at creation. Keep old pages alive for other aliases/registrations, but
+    // never let rearm bless them after this registration's original mapping has been replaced.
+    // Removing a sibling alias outside the requested range does not invalidate that identity.
+    for (auto& [id, registration] : w.registrations) {
+        (void)id;
+        if (registration.begin < end && registration.end > begin)
+            registration.mapping_valid = false;
+    }
     for (auto& [phys, pageptr] : w.pages_by_phys) {
         (void)phys;
         WatchedPage* page = pageptr.get();
@@ -1349,7 +1359,7 @@ GuestWriteWatchQuery GuestWriteWatch::query() const {
     std::lock_guard lock(w.mutex);
     auto found = w.registrations.find(id_);
     if (found == w.registrations.end()) { bump(stats().unknown); return GuestWriteWatchQuery::Unknown; }
-    if (found->second.gpu_dirty) {
+    if (!found->second.mapping_valid || found->second.gpu_dirty) {
         bump(stats().dirty);
         return GuestWriteWatchQuery::Dirty;
     }
@@ -1368,7 +1378,7 @@ bool GuestWriteWatch::rearm() {
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
     auto found = w.registrations.find(id_);
-    if (found == w.registrations.end()) return false;
+    if (found == w.registrations.end() || !found->second.mapping_valid) return false;
     std::vector<WatchedPage*> pages;
     for (const RegistrationPage& rp : found->second.pages) if (rp.page) pages.push_back(rp.page);
     if (!set_pages_armed(w, pages, true)) return false;   // couldn't re-protect -> caller re-creates
@@ -1761,6 +1771,21 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
         if (a.addr < lo) split_out.push_back({a.addr, lo - a.addr, a.phys, a.prot});
         split_out.push_back({lo, hi - lo, a.phys + (lo - a.addr), protection});
         if (hi < a_end) split_out.push_back({hi, a_end - hi, a.phys + (hi - a.addr), a.prot});
+        // Existing page records may still carry this alias's previous protection. A retained
+        // registration must take the same reset/create path as a fresh watch, including when the
+        // changed alias is outside its original VA range but names the same physical memory.
+        // Ordinary physical writes do not change this registration-lifetime contract.
+        const uint64_t phys_begin = a.phys + (lo - a.addr);
+        const uint64_t phys_end = a.phys + (hi - a.addr);
+        for (auto& [id, registration] : w.registrations) {
+            (void)id;
+            if (std::any_of(registration.pages.begin(), registration.pages.end(),
+                            [&](const RegistrationPage& rp) {
+                                return rp.page && rp.page->phys < phys_end &&
+                                       rp.page->phys + kPage > phys_begin;
+                            }))
+                registration.mapping_valid = false;
+        }
         invalidate_phys_range_locked(w, a.phys + (lo - a.addr), a.phys + (hi - a.addr));
     }
     for (const AliasRange& r : split_out) w.aliases.push_back(r);

@@ -1,9 +1,12 @@
-# `tests/gpu/recompiler` — RDNA2 → SPIR-V tests that need no Vulkan device
+# `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
-Everything here asks a question of `src/gpu/recompiler` alone: does this instruction stream decode,
+Most tests here ask a question of `src/gpu/recompiler` alone: does this instruction stream decode,
 does it recompile, does the module it produces have the shape the contract promises, and — just as
 often — does a stream that must NOT compile still reject, and reject *loudly*. No device is created,
 so these run everywhere and are the cheapest place in the project to pin a translator contract.
+The historical exception is `test_game_compute.cpp`: it executes synthetic shaders through the live
+Vulkan backend, including storage writeback, cache authority, and real mapped-page write watches.
+Its existing end-to-end fixtures remain here; new standalone execution tests belong in `execute/`.
 
 **The boundary against its siblings.** `tests/gpu/execute/` runs modules on a real device and
 asserts pixels or buffer contents; anything needing a queue belongs there, not here. Two large

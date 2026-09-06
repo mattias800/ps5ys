@@ -2781,7 +2781,8 @@ struct VulkanComputeContext {
                                       const uint8_t* current_source = nullptr,
                                       bool result_unchanged = false,
                                       bool source_snapshot_required = true,
-                                      bool compute_transfer_watch = false) {
+                                      bool compute_transfer_watch = false,
+                                      bool retain_export_watch = false) {
         auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
@@ -2833,9 +2834,14 @@ struct VulkanComputeContext {
             if (!cached.write_watch)
                 cached.write_watch = prosper::host::GuestWriteWatch::create(
                     key.gpu_addr, key.guest_bytes);
-        } else {
+        } else if (!retain_export_watch) {
             cached.write_watch.reset();
         }
+        // Export authority is revoked before dispatch, independently of the watch's lifetime.
+        // A successful exportable full writer can retain its registration until publication rearms
+        // it against the completed guest writeback. Resetting it here only makes publication rebuild
+        // the same page registration. Do not rearm early or restore export authority here; failure
+        // cleanup still invalidates the content and discards the watch.
         if (!source_was_valid) {
             // A failed dispatch/readback may have advanced the retained GPU result while leaving
             // guest memory at the old baseline. The successful repair must replace that invalidated
@@ -10562,7 +10568,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     ctx.validate_cached_image_source(
                         bi.cache_key, destination, bi.gpu_result_unchanged, !bi.seed_skip,
                         bi.seed_skip && bi.native_float_storage && r->img_dim == 2 &&
-                            native_3d_transfer_enabled());
+                            native_3d_transfer_enabled(),
+                        bi.graphics_sampled_usage && bi.exact_storage_bytes());
                 } else if (bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,

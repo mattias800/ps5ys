@@ -6056,9 +6056,30 @@ int main() {
                 alternating_changed.resources = std::make_shared<ShaderResourceTable>(fill_rt);
                 const uint64_t dynamic_snapshots_before =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                ShaderResource dynamic_sampled = fdst;
+                dynamic_sampled.cls = ResourceClass::Texture;
+                prosper::frontend::LiveComputeImageImport dynamic_import;
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "warm changing target has cross-submit watch-backed export authority");
+                dynamic_import = {};
+                const auto dynamic_watch_before = prosper::host::guest_write_watch_stats();
                 CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
                           prosper::frontend::execute_live_compute_items({it}),
                       "alternating full-coverage storage results execute");
+                const auto dynamic_watch_after = prosper::host::guest_write_watch_stats();
+                CHECK(dynamic_watch_after.create_attempts == dynamic_watch_before.create_attempts,
+                      "warm changing full writers reuse their export watch registration");
+                CHECK(dynamic_watch_after.rearms >= dynamic_watch_before.rearms + 2,
+                      "each changing writer rearms its retained export watch at publication");
+                CHECK(fill_equals(after_prove),
+                      "watch retention preserves exact alternating storage results");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "retained watch authorizes the completed result across submits");
+                dynamic_import = {};
                 const uint64_t dynamic_snapshots_after =
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
                 if (adaptive_storage_result_validation_enabled) {
@@ -6069,6 +6090,39 @@ int main() {
                               dynamic_snapshots_before + 2 * fill_guest_bytes,
                           "disabled adaptive policy preserves exact dynamic snapshots");
                 }
+                // The installed alternate-stack handler must dirty the retained registration on
+                // a real guest store, without a submit-local journal or an explicit GPU notification.
+                fill_guest[0] ^= 0xff;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import),
+                      "CPU write revokes a reused cross-submit export watch");
+                CHECK(prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "ordinary writeback repairs a guest store after watch reuse");
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes);
+                CHECK(mmap(fill_guest, fill_mapping_bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == fill_guest,
+                      "replace warm storage target backing at the same virtual address");
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    reinterpret_cast<uint64_t>(fill_guest), fill_mapping_bytes,
+                    0x33860000, 0x3 /* SCE CPU_READ|CPU_WRITE */);
+                CHECK(prosper::frontend::execute_live_compute_items({alternating_changed}) &&
+                          prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "full writers rebuild authority after guest target remapping");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import) &&
+                          dynamic_import.valid(),
+                      "replacement mapping obtains fresh cross-submit export authority");
+                dynamic_import = {};
+                fill_guest[0] ^= 0xff;
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          dynamic_sampled, fill_guest_bytes, dynamic_import),
+                      "CPU store to remapped target revokes the recreated export watch");
+                CHECK(prosper::frontend::execute_live_compute_items({it}) &&
+                          fill_equals(after_prove),
+                      "ordinary writeback repairs the remapped target after its CPU store");
             }
 #endif
 
