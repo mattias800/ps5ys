@@ -566,6 +566,15 @@ and budget-driven discards. The default budget is 512 MiB; override it with
 `vkAllocateMemory`/`vkFreeMemory`. The pool retains only allocation objects: images, buffers, views,
 descriptors, and their layout/content rules keep their existing per-call lifetimes.
 
+**Texture staging is a second, separate cache with its own budget.** It retains a staging block
+together with its CPU **mapping**, because dropping the mapping returns the pages and the next write
+faults all of them back in through amdgpu — ~30% of the frame on a 4K upload (#3405). Its budget is
+`PROSPER_MAPPED_STAGING_MB`, default **256 MiB**, accounted independently of the transient pool
+above, so peak retained host memory is the sum of the two rather than the pool figure alone.
+`PROSPER_NO_MAPPED_STAGING=1` disables reuse while leaving the allocation path identical — the
+A/B seam that isolates it — and `PROSPER_NO_MEMORY_POOL=1` disables this cache as well, so that
+flag still means "no staging is pooled" as it did before this cache existed.
+
 Within one already-synchronous backend call, identical immutable Vulkan contracts share objects instead of
 recreating them for every draw. Storage buffers require the same nonzero guest address, size, and complete
 captured bytes; synthetic resources with no identity remain distinct. Texture image views and samplers use
