@@ -100,6 +100,19 @@ static uint64_t mib_cap_old(const char* t) {
     return mib * 1024ull * 1024ull;
 }
 
+// --- tests/fixtures/render_runner.h : PROSPER_RENDER_COPY_THREADS -----------------------------
+// #3407: worker count for the parallel texture-staging copy. 0 means "derive from the core count",
+// so a malformed value must land on 0 rather than a wrapped 32 -- which is what a strtoul parse of
+// "-1" produced before this site used the helper.
+static uint64_t copy_threads_new(const char* n, const char* t) {
+    return env_u64_or_default_capped(n, t, 0ull, 32ull, "threads");
+}
+static uint64_t copy_threads_old(const char* t) {
+    if (!t || !*t) return 0ull;
+    const unsigned long parsed = std::strtoul(t, nullptr, 10);
+    return parsed > 32ul ? 32ull : static_cast<uint64_t>(parsed);
+}
+
 // --- tests/fixtures/render_runner.h : PROSPER_BACKEND_BUFFER_ARENA_KB --------------------------
 static uint64_t arena_new(const char* n, const char* t) {
     const uint64_t kib = env_u64_or_default_capped(n, t, 1024ull, UINT64_MAX / 1024ull, "KiB");
@@ -291,6 +304,8 @@ static const Site kSites[] = {
     // for both. A malformed value must keep the default rather than disable the bound.
     {"render_runner.h PROSPER_MAPPED_STAGING_MB", "PROSPER_MAPPED_STAGING_MB",
      mib_cap_new<256>, mib_cap_old<256>, "-1", 256ull * kMiB, "512", 512ull * kMiB},
+    {"render_runner.h PROSPER_RENDER_COPY_THREADS", "PROSPER_RENDER_COPY_THREADS",
+     copy_threads_new, copy_threads_old, "-1", 0ull, "4", 4ull},
 
     {"render_runner.h PROSPER_BACKEND_BUFFER_ARENA_KB", "PROSPER_BACKEND_BUFFER_ARENA_KB",
      arena_new, arena_old, "4mb", 1024ull * 1024ull, "2048", 2048ull * 1024ull},

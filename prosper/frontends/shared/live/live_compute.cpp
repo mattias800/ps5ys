@@ -8141,7 +8141,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         // RGBA16F.  Re-quantize those numeric values into the exact sampled Vulkan
                         // layout.  Guest-backed surfaces take the lossless memcpy path below.
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
+                        // #3407: per-texel and independent -- every write is upload[t*n+c],
+                        // disjoint across t -- so this is the same shape as the arm below that
+                        // already uses the helper. Leaving it scalar is why a 4K conversion took
+                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
+                        // on bytes touched per texel; the helper uses it only to size the pool.
+                        parallel_compute_texels(
+                            texels, texels * 16u, [&](size_t begin, size_t end) {
+                        for (size_t t = begin; t < end; ++t) {
                             uint32_t channels[4]{};
                             for (uint32_t c = 0; c < 4; ++c) {
                                 float value = 0.0f;
@@ -8162,6 +8169,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 (channels[2] << 20) | (channels[3] << 30);
                             std::memcpy(upload + t * sizeof(packed), &packed, sizeof(packed));
                         }
+                            });
                     } else if (sampled_float16_native &&
                                ((source_f16x2 && sampled_components == 2) ||
                                 (source_f16x1 && sampled_components == 1))) {
@@ -8181,7 +8189,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         }
                     } else if (sampled_uint8_native) {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
+                        // #3407: per-texel and independent -- every write is upload[t*n+c],
+                        // disjoint across t -- so this is the same shape as the arm below that
+                        // already uses the helper. Leaving it scalar is why a 4K conversion took
+                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
+                        // on bytes touched per texel; the helper uses it only to size the pool.
+                        parallel_compute_texels(
+                            texels, texels * 16u, [&](size_t begin, size_t end) {
+                        for (size_t t = begin; t < end; ++t) {
                             for (uint32_t c = 0; c < sampled_components; ++c) {
                                 if (source_r8) {
                                     upload[t] = pixels[t];
@@ -8200,9 +8215,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 }
                             }
                         }
+                            });
                     } else if (sampled_unorm8x2) {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
+                        // #3407: per-texel and independent -- every write is upload[t*n+c],
+                        // disjoint across t -- so this is the same shape as the arm below that
+                        // already uses the helper. Leaving it scalar is why a 4K conversion took
+                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
+                        // on bytes touched per texel; the helper uses it only to size the pool.
+                        parallel_compute_texels(
+                            texels, texels * 16u, [&](size_t begin, size_t end) {
+                        for (size_t t = begin; t < end; ++t) {
                             for (uint32_t c = 0; c < 2; ++c) {
                                 if (source_rg8) {
                                     upload[t * 2 + c] = pixels[t * 2 + c];
@@ -8219,9 +8242,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                 }
                             }
                         }
+                            });
                     } else if (sampled_unorm16_native) {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
+                        // #3407: per-texel and independent -- every write is upload[t*n+c],
+                        // disjoint across t -- so this is the same shape as the arm below that
+                        // already uses the helper. Leaving it scalar is why a 4K conversion took
+                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
+                        // on bytes touched per texel; the helper uses it only to size the pool.
+                        parallel_compute_texels(
+                            texels, texels * 16u, [&](size_t begin, size_t end) {
+                        for (size_t t = begin; t < end; ++t) {
                             for (uint32_t c = 0; c < sampled_components; ++c) {
                                 uint16_t value = 0;
                                 if (source_unorm8) {
@@ -8239,6 +8270,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                             &value, sizeof(value));
                             }
                         }
+                            });
                     } else if (f32) {
                         const size_t texels = static_cast<size_t>(volume_texels);
                         const uint32_t output_components =
@@ -8267,13 +8299,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             });
                     } else if (source_r8 && r8) {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
+                        // #3407: per-texel and independent -- every write is upload[t*n+c],
+                        // disjoint across t -- so this is the same shape as the arm below that
+                        // already uses the helper. Leaving it scalar is why a 4K conversion took
+                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
+                        // on bytes touched per texel; the helper uses it only to size the pool.
+                        parallel_compute_texels(
+                            texels, texels * 16u, [&](size_t begin, size_t end) {
+                        for (size_t t = begin; t < end; ++t) {
                             const uint8_t value = pixels[t];
                             upload[t * 4 + 0] = value;
                             upload[t * 4 + 1] = value;
                             upload[t * 4 + 2] = value;
                             upload[t * 4 + 3] = value;
                         }
+                            });
                     } else if (source_unorm8) {
                         if (!copy_snapshot_exact()) {
                             skip_image(r, "renderer RTT RGBA8 copy byte count mismatch");
@@ -8281,7 +8321,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         }
                     } else {
                         const size_t texels = static_cast<size_t>(volume_texels);
-                        for (size_t t = 0; t < texels; ++t) {
+                        // #3407: per-texel and independent -- every write is upload[t*n+c],
+                        // disjoint across t -- so this is the same shape as the arm below that
+                        // already uses the helper. Leaving it scalar is why a 4K conversion took
+                        // 25 ms on one core while 31 others idled. work_bytes is an upper bound
+                        // on bytes touched per texel; the helper uses it only to size the pool.
+                        parallel_compute_texels(
+                            texels, texels * 16u, [&](size_t begin, size_t end) {
+                        for (size_t t = begin; t < end; ++t) {
                             for (uint32_t c = 0; c < 4; ++c) {
                                 uint16_t half = 0;
                                 std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
@@ -8292,6 +8339,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     std::lround(value * 255.0f));
                             }
                         }
+                            });
                     }
                     if (trace) {
                         const uint64_t snapshot_hash = fnv1a(live_target.pixels->data(),
