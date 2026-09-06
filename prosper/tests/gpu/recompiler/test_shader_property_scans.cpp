@@ -130,12 +130,12 @@ constexpr uint32_t branch(uint32_t opcode, int displacement) {
 } // namespace
 
 int main() {
-    // The allocation contract deliberately excludes the optional diagnostic's deduplicating set.
-#ifdef _WIN32
-    _putenv_s("PROSPER_PROLOGLOG", "");
-#else
-    unsetenv("PROSPER_PROLOGLOG");
-#endif
+    // CTest removes this before process startup. Do not mutate a diagnostic that other code can
+    // cache: the allocation contract excludes its deduplicating set, including on direct runs.
+    if (std::getenv("PROSPER_PROLOGLOG")) {
+        std::fprintf(stderr, "shader property scans: PROSPER_PROLOGLOG must be absent\n");
+        return 2;
+    }
     check(rdna2_decode_one(&unknown, 1).fmt == Rdna2Format::Unknown,
           "unknown terminator control really decodes as Unknown");
     const uint32_t allocation_control[] = {nop, endpgm};
