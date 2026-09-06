@@ -181,8 +181,16 @@ static int run_list(VkCommandBuffer cmd, VkPipeline pipeline,
     return ok && seen > 0;
 }
 
+#ifdef PROSPER_RENDERDOC_CONTROL
+#include "renderdoc_control.h"
+int main(int argc, char** argv)
+#else
 int main(void)
+#endif
 {
+#ifdef PROSPER_RENDERDOC_CONTROL
+    require(argc == 2, "usage: renderdoc_control <new capture path template>");
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
 
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -225,6 +233,9 @@ int main(void)
     r = vkCreateDevice(g_pd, &di, NULL, &g_dev);
     if (r) die("vkCreateDevice", r);
     vkGetDeviceQueue(g_dev, g_queue_family, 0, &g_queue);
+#ifdef PROSPER_RENDERDOC_CONTROL
+    capture_begin(argv[1]);
+#endif
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g_pd, &props);
@@ -469,5 +480,8 @@ int main(void)
                              : "DIVERGENCE: indexed reads are ordinals");
 
     vkDeviceWaitIdle(g_dev);
+#ifdef PROSPER_RENDERDOC_CONTROL
+    capture_end();
+#endif
     return discriminating_ok ? 0 : 1;
 }

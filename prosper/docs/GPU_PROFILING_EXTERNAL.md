@@ -119,12 +119,13 @@ aims itself and warns loudly when the renderer has not yet published a context.
 zero draws: guest work is submitted off that thread, and the loop can spin at 260 fps while the guest
 renders far slower. The span closes on a guest present, and the log says which of the two closed it.
 
-**The Fedora package does NOT ship the Python bindings** — `rpm -ql renderdoc` gives `qrenderdoc` (the
-GUI) and `librenderdoc.so`, no `renderdoc.so` python module, and there is no `python3-renderdoc` to
-install. So *pixel history*, *per-draw render-target export* and *shader debugging* — the replay-side
-analysis, and the most valuable half — are **not** reachable from a script here without building
-RenderDoc from source. What is reachable headless is `convert` (`xml`, or `chrome.json` for a
-Perfetto-openable timeline), and handing the `.rdc` to a human with `qrenderdoc`.
+**A missing system Python module does not rule out scripted replay.** The tested Fedora package
+embeds bindings in `qrenderdoc`; `qrenderdoc --python` with the offscreen Qt platform can run
+replay scripts without entering the UI event loop. The [verified control and wrapper](DEBUGGING_WORKFLOWS.md#renderdoc-prove-capture-replay-and-data-inspection)
+capture five indexed draws, replay them, check exact SSBO contents and export a render target.
+Pixel history and shader debugging still need their own capability checks; this control does not
+certify them. `convert` also exports `xml` or `chrome.json` API events, but those event durations
+are not hardware GPU execution timings.
 
 ## `radeontop` — the 60-second "is this even GPU-bound?" triage
 

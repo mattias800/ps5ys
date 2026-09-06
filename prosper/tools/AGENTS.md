@@ -3,6 +3,11 @@
 Developer/agent tooling. These are debugging and verification aids, not part of
 the shipped runtime. Build them from `build-linux/` like everything else.
 
+Start with [Debugging and profiling workflows](../docs/DEBUGGING_WORKFLOWS.md) for the
+question-to-tool map. `doctor/` validates external instruments with bounded positive controls,
+provides a small standalone sanitizer build of existing host tests, and verifies RenderDoc
+capture/replay without requiring an importable system Python module.
+
 - **`evidence/prerender_check.py`** - **run this before publishing a progression screenshot.** It
   answers whether the frame is the game's own PRE-RENDERED picture rather than something prosper
   rendered: a full-screen loading blit is the most convincing false evidence this project has
@@ -675,7 +680,8 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
   the HOST-side "which C++ function is burning CPU" first look (render/submit thread, readback copy,
-  detile, FP16 decode). Works where `perf` is denied (`perf_event_paranoid>=2`) via ptrace-attach.
+  detile, FP16 decode). Fallback where the required `perf` recording is denied; a paranoid value
+  of 2 excludes kernel sampling but does not universally forbid user-space profiling.
   `--thread REGEX` isolates one thread, `--mode folded` emits flamegraph stacks. Complements
   `guest_bt` (which does the GUEST/managed-C# side). `--self-test` checks the symbol parser.
   See `hostprof/README.md`.
@@ -728,7 +734,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   The report separates evidence for CPU work outside the timed renderer, renderer resource work,
   GPU device/wait/readback cost, compute batches, and frame-pacing gaps. It deliberately reports
   unavailable/inconclusive fields instead of inventing a verdict. This is a broad localizer, not a
-  stack sampler: after it points at host CPU, use `hostprof`; after it points at a graphics phase,
+  stack sampler: after it points at host CPU, use `perf` (`hostprof` when unavailable); after it points at a graphics phase,
   use the existing focused timing/capture tools. The always-on pre-trigger cost is one atomic due
   check per app loop and one process sample every 250 ms; detailed clocks run only post-trigger.
 - **`perf/compute_phase_report.py`** — roll up the **compute** side of a run, the way
@@ -779,10 +785,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     same state, the same `wchan` (`futex_do_wait`) and the same syscall (202). On a purpose-built
     control with three threads blocked in three known functions, `/proc` reported two of them
     identically; the stack separated them. Do not conclude *which* primitive from `wchan`.
-  - **Run gdb on the same side of the container boundary as the target.** Measured both ways:
-    host+host works, distrobox+distrobox works, and **host process + in-container gdb is
-    `ptrace: Operation not permitted`**. Since `prosper-app` normally runs inside distrobox, run this
-    inside the same container. The rule is *same namespace*, not *always the host*. This matters
+  - **Verify debugger access to the actual target.** Earlier measurements found host+host and
+    distrobox+distrobox worked, while host process + in-container gdb was denied. Prefer the
+    target's environment, but credentials, namespaces and security policy determine access;
+    neither "always host" nor "always container" guarantees it. This matters
     because the denial produces **no stacks**, which is byte-identical to a process with nothing
     blocked — so a mis-sited gdb reads as a clean result. The tool detects that case by name; it
     counts any empty sample as FAILED, prints the failed count even when zero, and exits non-zero if

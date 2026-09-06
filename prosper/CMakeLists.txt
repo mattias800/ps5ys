@@ -140,6 +140,8 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  add_test(NAME diagnostic_doctor
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/doctor/test_doctor.py")
   # self_dump --import-slots reads DT_JMPREL/DT_RELA to answer "which GOT slot does this Sony import
   # land in" (#1625). The fixtures are PS5-shaped ELFs written byte by byte in the test, so they are
   # an independent statement of the relocation layout rather than anything self_dump produced, and

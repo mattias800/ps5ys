@@ -9,10 +9,12 @@ fraction of wall-time each function sits on top of the stack. More `-n` samples 
 
 ## Why this exists (and why not `perf`)
 
-- **`perf` is unusable on locked-down hosts.** `kernel.perf_event_paranoid >= 2` (the default on the
-  Bazzite dev box, and many hardened distros) denies the `perf_event_open` syscalls without root.
-  `gdb` ptrace-attach works whenever `kernel.yama.ptrace_scope = 0` (or from a parent/root), so hostprof
-  keeps working where `perf` cannot.
+- **Fallback when `perf` sampling is unavailable.** `kernel.perf_event_paranoid=2` excludes
+  kernel sampling but does not universally forbid user-space events. Test actual recording with
+  the [capability controls](../../docs/DEBUGGING_WORKFLOWS.md) before falling back to stopped-stack
+  sampling: `doctor.py --probe perf` answers for user-space sampling alone, which is the arm that
+  decides whether you need this tool at all. Debugger access has separate credential/namespace/security checks;
+  `ptrace_scope=0` alone does not guarantee attach permission.
 - **It generalizes the ad-hoc `tools/dbg/*.sh` sampling scripts.** Those dump *raw* all-thread
   backtraces to a fixed path for one specific title and leave the aggregation to hand-written `awk`.
   hostprof takes any pid/name, ranks leaves, strips template + argument noise from C++ symbols, filters

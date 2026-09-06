@@ -21,6 +21,15 @@ an independently generated oracle. This catches most bugs deterministically and 
 Using `llvm-mc` to assemble authoritative RDNA2 encodings (and `glslangValidator` for GLSL→SPIR-V)
 means the test inputs are ground truth, not our own assumptions.
 
+### Host sanitizer checks
+
+For memory and concurrency diagnostics, the standalone [host sanitizer suite](DEBUGGING_WORKFLOWS.md#isolated-host-sanitizer-checks)
+builds SELF parsing, RDNA2 decoding, BC decoding and submit-gate tests directly against production
+sources. ASan/UBSan and TSan configurations include clean and deliberately faulty instrument controls;
+a missing runtime or initialization failure cannot count as bug detection. The `host-sanitizers`
+and `host-tsan` CI jobs run those two configurations. This is focused host coverage, not sanitized
+guest execution.
+
 ## 2. Render → readback → pixel/region assertions
 
 `test_vulkan_triangle` renders offscreen on **llvmpipe** (deterministic software rasterizer),

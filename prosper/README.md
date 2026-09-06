@@ -12,6 +12,9 @@ tracks 39 titles across Unity/IL2CPP, Unreal Engine, RAGE, Hedgehog Engine and c
 segments are unencrypted, which is what makes the project possible without console keys. Dumps are
 user-supplied and gitignored.
 
+For development, start with [Debugging and profiling workflows](docs/DEBUGGING_WORKFLOWS.md):
+question-to-tool recipes, capability controls, host sanitizer checks and GPU capture analysis.
+
 ## Status
 - ✅ **M0–M1 — Recon, tooling & loader.** Format cracked; SELF/ELF → relocatable image → multi-module
   link → NID import binding.

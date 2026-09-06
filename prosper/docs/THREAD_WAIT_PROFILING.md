@@ -114,7 +114,7 @@ discarded, got an empty report, and read it as "nothing blocked" for a process w
 The tool now counts an empty sample as **FAILED**, prints the failed count **even when zero**, and exits
 non-zero if every sample failed rather than printing a clean-looking empty report.
 
-**2. The debugger must be on the same side of the container boundary as the target.** Measured all three ways:
+**2. Test debugger access in the target's environment.** The original measurements were:
 
 ```
 process on host      + gdb on host       -> works
@@ -122,9 +122,11 @@ process in distrobox + gdb in distrobox  -> works
 process on host      + gdb in distrobox  -> ptrace: Operation not permitted
 ```
 
-Per trap 1 the denial is *silent*, so guidance that puts the debugger on the wrong side does not produce an
-error — it produces a clean-looking empty profile. (The first version of this tool said "run on the HOST",
-which is right only for a host process and wrong for prosper, which runs in the container.)
+These are observations of that setup, not universal host/container rules: credentials, namespaces
+and security policy determine access. Prefer the target's environment, then require a successful
+attach to the actual target. The [doctor child control](DEBUGGING_WORKFLOWS.md) checks only
+same-environment child access. Per trap 1, discarding a denial can turn it into a clean-looking
+empty profile; neither "always host" nor "always container" is a substitute for observing stacks.
 
 **3. Versioned symbols defeat anchored patterns.** glibc reports `pthread_cond_wait@@GLIBC_2.3.2`. Any
 `$`-anchored match over the raw string fails, so the wait wrapper is classified as *application* code and
