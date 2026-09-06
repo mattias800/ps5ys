@@ -143,6 +143,35 @@ while neither does alone, and a previously inactive owner may gain a writer. Bot
 publication use the same member-aware key. These are seed-safety constraints, not a static proof
 that a shader's coverage is invariant under arbitrary input changes (#3391).
 
+### Write-watch alias protection
+
+Storage-result and texture caches may reuse a physical-page watch while other registrations still
+reference it. A guest permission change must update every retained alias's permissions before the
+production watch or diagnostic trace restores pages; recreating one registration does not recreate
+that shared page record. Late read-only aliases are retained so a later write upgrade cannot escape
+coverage. Trace invalidation follows physical topology, including aliases omitted from its original
+writable-only set (#3387).
+
+Failed production protection transitions explicitly invalidate page coverage. Neither a replacement watch nor
+a same-state rearm may publish Unchanged without a complete protection pass. Last-owner cleanup
+retains fault-recovery metadata if restoration fails; mapping removal can later reclaim it. A fault
+on a guest-revoked alias remains unhandled, and a trace's already-owned single-step still completes
+as invalid without restoring revoked permissions. Windows/macOS keep their existing safe fallback.
+This does not establish complete recovery after diagnostic-only partial protection failures.
+
+### Ruled out: shared watch reconstruction
+
+- **Reset/create repairs stale alias protections even when another registration survives:** falsified
+  by real shared mappings, a fresh Unchanged control and a raw upgraded-alias store that failed to
+  dirty the replacement. Updating only the mapping registry leaves the shared page stale (#3387).
+- **Disarming cannot undo an already-successful permission downgrade:** falsified by actual read/write
+  probes immediately after notification and last-owner release, for both RO and PROT_NONE. Production
+  and Armed diagnostic owners both restored old permissions; metadata reconciliation precedes either
+  restoration now (#3387).
+- **An armed bit plus a fresh generation proves complete coverage after a failed protection call:**
+  falsified by an inaccessible sibling alias. Forced reprotection and an explicit incomplete-coverage
+  state are required; attempted restoration is not proof that a faulting store can resume (#3387).
+
 ### Ruled out: per-binding seed safety
 
 - **A write-only owner's reflection is sufficient to omit seed data, provided untouched image

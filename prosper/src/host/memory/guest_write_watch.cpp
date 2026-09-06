@@ -619,6 +619,9 @@ struct WatchedPage {
     uint64_t phys = 0, generation = 0;
     uint32_t references = 0;
     bool armed = false;
+    // A failed transition can leave some aliases protected and others writable. Keep the fault
+    // recovery record, but never publish Unchanged or skip the next complete protection pass.
+    bool coverage_incomplete = false;
     std::vector<PageAlias> aliases;
 };
 struct RegistrationPage { WatchedPage* page = nullptr; uint64_t generation = 0; };
@@ -757,7 +760,7 @@ std::vector<ProtectionRun> protection_runs(const WatchState& w,
         if (!page) continue;
         const bool prior_read_only = page_requires_read_only_locked(w, *page, page->armed);
         const bool wanted_read_only = page_requires_read_only_locked(w, *page, arm);
-        if (prior_read_only == wanted_read_only) continue;
+        if (prior_read_only == wanted_read_only && !page->coverage_incomplete) continue;
         for (const PageAlias& alias : page->aliases) {
             if (!cpu_writable(alias.prot)) continue;
             const int full = host_prot(alias.prot);
@@ -786,7 +789,8 @@ std::vector<ProtectionRun> protection_runs(const WatchState& w,
 
 // mprotect every writable alias of `pages` to read-only (arm) or back to its guest prot (disarm).
 // Read-only / PROT_NONE aliases are left untouched (a CPU store can't dirty them). Returns false and
-// rolls back on the first mprotect failure so the guest is never left with a wrong protection.
+// attempts rollback on the first mprotect failure. Failed/partial coverage remains explicit until
+// a complete pass succeeds; rollback itself can fail and is not proof that all aliases are restored.
 bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool arm) {
     if (arm && w.trace.status == GuestDmemWriteTraceStatus::Stepping &&
         std::any_of(pages.begin(), pages.end(), [&](const WatchedPage* page) {
@@ -798,6 +802,7 @@ bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool
     for (const ProtectionRun& run : runs) {
         if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
                            static_cast<size_t>(run.size), run.to) != 0) {
+            for (WatchedPage* page : pages) if (page) page->coverage_incomplete = true;
             while (changed) {
                 const ProtectionRun& prior = runs[--changed];
                 watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
@@ -807,8 +812,21 @@ bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool
         }
         ++changed;
     }
-    for (WatchedPage* page : pages) if (page && page->armed != arm) page->armed = arm;
+    for (WatchedPage* page : pages) if (page) {
+        page->armed = arm;
+        page->coverage_incomplete = false;
+    }
     return true;
+}
+
+void erase_released_pages_locked(WatchState& w, const std::vector<WatchedPage*>& pages) {
+    for (WatchedPage* page : pages) {
+        // Failed restoration may leave real guest-writable VAs read-only. Retain their fault index
+        // even after the last registration goes away; normal mapping removal retries cleanup.
+        if (page->references || page->armed || page->coverage_incomplete) continue;
+        for (const PageAlias& alias : page->aliases) w.pages_by_addr.erase(alias.addr);
+        w.pages_by_phys.erase(page->phys);
+    }
 }
 
 void release_registration_locked(WatchState& w,
@@ -821,16 +839,12 @@ void release_registration_locked(WatchState& w,
         released.push_back(page);
     }
     set_pages_armed(w, released, false);
-    for (WatchedPage* page : released) {
-        for (const PageAlias& al : page->aliases) w.pages_by_addr.erase(al.addr);
-        w.pages_by_phys.erase(page->phys);
-    }
+    erase_released_pages_locked(w, released);
     w.registrations.erase(reg);
 }
 
-// A dmem topology/protection change makes every currently-watched page overlapping the changed range
-// Dirty (bump generation) and unmapped from the address index; the next query reads Dirty/Unknown and
-// the renderer re-establishes a fresh watch. Called with the lock held.
+// A dmem topology/protection change disarms and dirties overlapping physical pages. Keep their
+// address index while registrations or failed-restoration recovery still need it. Called locked.
 void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t phys_end) {
     std::vector<WatchedPage*> hit;
     for (auto& [phys, page] : w.pages_by_phys)
@@ -844,9 +858,9 @@ void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t p
 // next query reads Dirty). This is what resolves review B4: no stale VA survives in pages_by_addr for a
 // later handle_fault to mprotect after the VA has been unmapped/reused. Does NOT mprotect the vanishing
 // VAs (the caller is unmapping/remapping them; the kernel drops their protection) and — critically — does
-// NOT free the WatchedPage: page lifetime is reference-counted and owned by release_registration_locked,
-// so freeing one here would dangle a live Registration's raw pointer. A page that loses its last alias
-// just lingers, disarmed and Dirty, until its owning registration resets. Called with the lock held.
+// NOT free a referenced WatchedPage, which would dangle a live Registration's raw pointer. A page
+// that loses its last alias lingers until its owning registration resets. Unreferenced recovery-only
+// records can be reclaimed once their remaining aliases are safely restored. Called locked.
 void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool remove_topology) {
     // A registration belongs to its requested VA range, not merely to the physical pages that
     // happened to back it at creation. Keep old pages alive for other aliases/registrations, but
@@ -857,6 +871,7 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
         if (registration.begin < end && registration.end > begin)
             registration.mapping_valid = false;
     }
+    std::vector<WatchedPage*> recovery;
     for (auto& [phys, pageptr] : w.pages_by_phys) {
         (void)phys;
         WatchedPage* page = pageptr.get();
@@ -871,8 +886,13 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
                 ++ai;
             }
         }
-        if (changed) page->generation++;
+        if (changed) {
+            page->generation++;
+            if (!page->references) recovery.push_back(page);
+        }
     }
+    set_pages_armed(w, recovery, false);
+    erase_released_pages_locked(w, recovery);
     if (remove_topology)
         w.aliases.erase(std::remove_if(w.aliases.begin(), w.aliases.end(),
                                        [&](const AliasRange& a) {
@@ -1336,13 +1356,12 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
         reg.pages.push_back({page, page->generation});
     }
     if (!set_pages_armed(w, to_arm, true)) {
-        // Undo references + any pages we just created; report protect failure -> Unknown.
+        // Undo references and restore newly created pages; retain recovery metadata if restoration
+        // also fails. The attempted registration still reports protect failure -> Unknown.
         for (const RegistrationPage& rp : reg.pages)
             if (rp.page && rp.page->references) rp.page->references--;
-        for (WatchedPage* page : to_arm) {
-            for (const PageAlias& al : page->aliases) w.pages_by_addr.erase(al.addr & ~(kPage - 1));
-            w.pages_by_phys.erase(page->phys);
-        }
+        set_pages_armed(w, to_arm, false);
+        erase_released_pages_locked(w, to_arm);
         bump(stats().create_protect_failures);
         return {};
     }
@@ -1364,7 +1383,8 @@ GuestWriteWatchQuery GuestWriteWatch::query() const {
         return GuestWriteWatchQuery::Dirty;
     }
     for (const RegistrationPage& rp : found->second.pages) {
-        if (!rp.page || !rp.page->armed || rp.page->generation != rp.generation) {
+        if (!rp.page || !rp.page->armed || rp.page->coverage_incomplete ||
+            rp.page->generation != rp.generation) {
             bump(stats().dirty);
             return GuestWriteWatchQuery::Dirty;
         }
@@ -1698,8 +1718,9 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
 
     // A new alias to an already-watched physical page must be armed too, or a write through it would not
     // fault and the renderer would trust a stale texture (review B2). Same-phys aliasing does not change
-    // content, so we do NOT bump generation — we extend the page's alias set and arm the new VA in place.
-    if (!cpu_writable(protection) || w.pages_by_phys.empty()) return;   // nothing armed to extend
+    // content, so we do NOT bump generation on success. Retain even RO aliases so a later protection
+    // upgrade can update this shared record; only writable aliases need arming now.
+    if (w.pages_by_phys.empty()) return;   // nothing armed to extend
     for (uint64_t off = 0; off < size; off += kPage) {
         auto it = w.pages_by_phys.find(phys + off);
         if (it == w.pages_by_phys.end()) continue;
@@ -1707,10 +1728,12 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
         const uint64_t va = (addr + off) & ~(kPage - 1);
         page->aliases.push_back({va, protection});
         w.pages_by_addr[va] = page;
-        if (page->armed &&
+        if (page->armed && cpu_writable(protection) &&
             watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), kPage,
-                           host_prot(protection) & ~PROT_WRITE) != 0)
-            page->generation++;   // couldn't arm the new alias -> mark Dirty so the renderer re-creates
+                           host_prot(protection) & ~PROT_WRITE) != 0) {
+            page->generation++;
+            page->coverage_incomplete = true;
+        }
     }
 }
 
@@ -1745,12 +1768,33 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
     if (!w.fault_onstack.load(std::memory_order_acquire)) return;   // feature off -> nothing tracked
     std::lock_guard lock(w.mutex);
     const uint64_t end = addr + size;
+    // POSIX has already applied the new guest permissions. Both owners must use those permissions
+    // before any disarm restores aliases; stale RW metadata would undo a successful RO/NONE change.
+    for (auto& [phys, page] : w.pages_by_phys) {
+        (void)phys;
+        for (PageAlias& alias : page->aliases)
+            if (alias.addr < end && alias.addr + kPage > addr) {
+                alias.prot = protection;
+                page->coverage_incomplete = true;
+            }
+    }
+    for (DmemTracePage& page : w.trace.pages)
+        for (PageAlias& alias : page.aliases)
+            if (alias.addr < end && alias.addr + kPage > addr) alias.prot = protection;
     if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
         w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
         bool overlap = false;
-        for (const DmemTracePage& page : w.trace.pages)
-            for (const PageAlias& alias : page.aliases)
-                if (alias.addr < end && alias.addr + kPage > addr) overlap = true;
+        // A RO alias was not in the trace's writable-only arm set. Resolve through live physical
+        // topology so upgrading that previously invisible sibling also invalidates trace coverage.
+        for (const AliasRange& alias : w.aliases) {
+            const uint64_t lo = std::max(addr, alias.addr);
+            const uint64_t hi = std::min(end, alias.addr + alias.size);
+            if (lo >= hi) continue;
+            const uint64_t first = alias.phys + (lo - alias.addr);
+            const uint64_t last = alias.phys + (hi - alias.addr);
+            for (const DmemTracePage& page : w.trace.pages)
+                if (page.phys < last && page.phys + kPage > first) overlap = true;
+        }
         if (overlap)
             trace_invalidate_locked(w, GuestDmemWriteTraceInvalidReason::MappingProtectionChanged,
                                     w.trace.status == GuestDmemWriteTraceStatus::Stepping);
@@ -1771,7 +1815,7 @@ void guest_write_watch_notify_direct_mapping_protection(uint64_t addr, uint64_t 
         if (a.addr < lo) split_out.push_back({a.addr, lo - a.addr, a.phys, a.prot});
         split_out.push_back({lo, hi - lo, a.phys + (lo - a.addr), protection});
         if (hi < a_end) split_out.push_back({hi, a_end - hi, a.phys + (hi - a.addr), a.prot});
-        // Existing page records may still carry this alias's previous protection. A retained
+        // Existing registrations were established under this alias's previous protection. A retained
         // registration must take the same reset/create path as a fresh watch, including when the
         // changed alias is outside its original VA range but names the same physical memory.
         // Ordinary physical writes do not change this registration-lifetime contract.
@@ -2111,10 +2155,24 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         trace_va_to_phys_locked(w.trace, addr, trace_fault_phys);
     if (!production_page && !trace_page) return GuestWriteWatchFaultAction::NotHandled;
 
+    // Retained alias permissions are reconciled before protection-change invalidation. Check the
+    // faulting VA, not just physical-page membership: a revoked sibling is a genuine guest fault,
+    // including while another thread still owns the trace's pending single-step window.
+    const auto writable_alias = [&](const std::vector<PageAlias>& aliases) {
+        return std::any_of(aliases.begin(), aliases.end(), [&](const PageAlias& alias) {
+            return alias.addr == fault_page && cpu_writable(alias.prot);
+        });
+    };
+    const bool fault_writable = production_page ? writable_alias(production_page->aliases)
+        : std::any_of(w.trace.pages.begin(), w.trace.pages.end(), [&](const DmemTracePage& page) {
+              return writable_alias(page.aliases);
+          });
+    if (!fault_writable) return GuestWriteWatchFaultAction::NotHandled;
+
     bool production_handled = false;
     bool production_faulting_alias_restored = false;
     auto disarm_production_page = [&](WatchedPage* page) {
-        if (!page || !page->armed) return;
+        if (!page || (!page->armed && !page->coverage_incomplete)) return;
         bool restored = true;
         bool page_faulting_alias_restored = page != production_page;
         for (const PageAlias& alias : page->aliases) {
@@ -2128,6 +2186,7 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
                 page_faulting_alias_restored = true;
         }
         page->generation++;
+        page->coverage_incomplete = !restored;
         // Preserve #1144's stale-alias contract: a failure on a non-faulting alias must not leave the
         // successfully restored faulting VA logically armed. For diagnostic-only sibling pages there
         // is no faulting VA, so require the complete restore instead.
@@ -2137,7 +2196,8 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         production_handled = true;
     };
 
-    if (production_page && !production_page->armed && !trace_page) {
+    if (production_page && !production_page->armed && !production_page->coverage_incomplete &&
+        !trace_page) {
         // Two guest workers can take the same RO-page fault before either signal handler runs. The
         // first handler restores RW and clears `armed`; the second delivery is already queued and used
         // to fall through as a fatal guest fault despite the store now being safe to retry (Cobra's
@@ -2203,8 +2263,8 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
     if (!trace_page) {
         disarm_production_page(production_page);
         if (production_handled) bump(stats().faults);
-        return production_handled ? GuestWriteWatchFaultAction::Resume
-                                  : GuestWriteWatchFaultAction::NotHandled;
+        return production_faulting_alias_restored ? GuestWriteWatchFaultAction::Resume
+                                                 : GuestWriteWatchFaultAction::NotHandled;
     }
 
     // The diagnostic opens every selected physical page for the one stepped instruction. Mark any
@@ -2284,8 +2344,8 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         w.trace.armed = false;
         w.trace.status = GuestDmemWriteTraceStatus::Invalid;
         w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::ProtectFailed;
-        return production_handled ? GuestWriteWatchFaultAction::Resume
-                                  : GuestWriteWatchFaultAction::NotHandled;
+        return production_faulting_alias_restored ? GuestWriteWatchFaultAction::Resume
+                                                 : GuestWriteWatchFaultAction::NotHandled;
     }
     if (!all_restored) {
         w.trace.invalid_reason = GuestDmemWriteTraceInvalidReason::ProtectFailed;
