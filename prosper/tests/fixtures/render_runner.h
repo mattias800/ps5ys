@@ -694,6 +694,26 @@ struct PersistentPipelineKey {
     }
 };
 
+inline VkPrimitiveTopology pipeline_topology_class(VkPrimitiveTopology topology) {
+    // Dynamic topology is core, but unrestricted changes BETWEEN topology classes are not.
+    // Retain the class on every device rather than depending on extended_dynamic_state3.
+    switch (topology) {
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    default:
+        return topology; // points, patches, and unknown values stay distinct
+    }
+}
+
 struct PersistentPipelineKeyHash {
     size_t operator()(const PersistentPipelineKey& key) const {
         return static_cast<size_t>(key.hash);
@@ -6328,6 +6348,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         float depth_bias_slope = 0.0f;
         VkStencilOpState stencil_front{};
         VkStencilOpState stencil_back{};
+        VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkBool32 primitive_restart = VK_FALSE;
+        VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
+        VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE, stencil_test = VK_FALSE;
+        VkCompareOp depth_compare = VK_COMPARE_OP_NEVER;
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
         int32_t vertex_offset = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
@@ -7182,6 +7208,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // strip-restart sentinel index (0xFFFF/0xFFFFFFFF), and it has no effect on list topologies.
         ia.primitiveRestartEnable = VK_TRUE;
 #endif
+        v.topology = ia.topology;
+        v.primitive_restart = ia.primitiveRestartEnable;
         // Default: full-target viewport. When the resolved state carries the guest's PA_CL_VPORT transform,
         // honor it — a guest yscale < 0 arrives as a negative viewport_h (Vulkan core-1.1 flipped viewport),
         // reproducing the hardware's Y orientation (#38; each draw item keeps its own resolved viewport).
@@ -7206,6 +7234,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
             VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+            VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+            VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+            VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+            VK_DYNAMIC_STATE_STENCIL_OP,
+            VK_DYNAMIC_STATE_CULL_MODE,
+            VK_DYNAMIC_STATE_FRONT_FACE,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+            VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         };
         VkPipelineDynamicStateCreateInfo dynamic_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic_state.dynamicStateCount = static_cast<uint32_t>(std::size(dynamic_states));
@@ -7234,6 +7271,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             rs.depthBiasClamp = render_vk_ctx().depth_bias_clamp_enabled ? ps->depth_bias_clamp : 0.0f;
         }
         v.line_width = rs.lineWidth;
+        v.cull_mode = rs.cullMode;
+        v.front_face = rs.frontFace;
         v.depth_bias_constant = rs.depthBiasConstantFactor;
         v.depth_bias_clamp = rs.depthBiasClamp;
         v.depth_bias_slope = rs.depthBiasSlopeFactor;
@@ -7319,7 +7358,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         if (ps && ps->stencil_enable) {
             // Wire the front/back stencil op-state so masks clip (e.g. the title shimmer tests the
-            // stencil the logo draw wrote). ref/compareMask/writeMask are baked (not dynamic).
+            // stencil the logo draw wrote). All per-face values are recorded dynamically.
             dss.stencilTestEnable = VK_TRUE;
             auto mkop = [&](int fb) {
                 VkStencilOpState s{};
@@ -7371,6 +7410,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         v.stencil_front = dss.front;
         v.stencil_back = dss.back;
+        v.depth_test = dss.depthTestEnable;
+        v.depth_write = dss.depthWriteEnable;
+        v.depth_compare = dss.depthCompareOp;
+        v.stencil_test = dss.stencilTestEnable;
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         const auto fixed_dss_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) res_fixed_depth_stencil_ms += setup_elapsed_ms(fixed_blend_ready, fixed_dss_ready);
@@ -8483,7 +8526,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.pDynamicState = &dynamic_state;
         gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
-        if (ps && (ps->depth_test_enable || ps->stencil_enable)) gp.pDepthStencilState = &dss;
+        // Every pipeline in a depth/stencil pass has the same static contract, including draws
+        // which disable both tests. Their enables are recorded with the other dynamic state.
+        if (use_ds) gp.pDepthStencilState = &dss;
         ++pipeline_stats.references;
         bool create_pipeline = true;
         PersistentPipelineKey pipeline_key;
@@ -8503,7 +8548,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(12); // dynamic viewport/bias/stencil values; descriptor arity #2471; MRT formats #1390
+            append(13); // core dynamic depth/stencil/cull/topology; retain topology class (#3419)
             append(W); append(H); append(color_count);
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 append(static_cast<uint32_t>(color_formats[slot]));
@@ -8562,8 +8607,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     append(stage_flags);   // count already keyed above, for both branches
                 }
             }
-            append(ia.topology); append(ia.primitiveRestartEnable);
-            append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace);
+            append(pipeline_topology_class(ia.topology));
+            append(rs.polygonMode);
             append(rs.depthBiasEnable);
             append(cb.logicOpEnable); append(cb.logicOp);
             for (uint32_t attachment = 0; attachment < color_count; ++attachment) {
@@ -8574,13 +8619,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             append(gp.pDepthStencilState != nullptr);
             if (gp.pDepthStencilState) {
-                append(dss.depthTestEnable); append(dss.depthWriteEnable); append(dss.depthCompareOp);
-                append(dss.depthBoundsTestEnable); append(dss.stencilTestEnable);
-                auto append_stencil = [&](const VkStencilOpState& stencil) {
-                    append(stencil.failOp); append(stencil.passOp); append(stencil.depthFailOp);
-                    append(stencil.compareOp);
-                };
-                append_stencil(dss.front); append_stencil(dss.back);
+                append(dss.depthBoundsTestEnable);
                 append_float(dss.minDepthBounds); append_float(dss.maxDepthBounds);
             }
             auto found = pipeline_cache.find(pipeline_key);
@@ -9526,7 +9565,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                   return n;
                               }());   // #2333
     // Every dynamic state these pipelines declare, set once per draw. It is a lambda rather than
-    // eleven inline calls because the PROSPER_DRAW_ISO re-render below replays the SAME pipelines
+    // duplicated calls because the PROSPER_DRAW_ISO re-render below replays the SAME pipelines
     // into a second command buffer, and it set NONE of this (#3248): the isolation pass therefore
     // ran under undefined viewport, scissor, line width, depth bias and stencil state while
     // reporting which draw paints a pixel -- a diagnostic answering about a render that is not the
@@ -9556,6 +9595,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                  v.stencil_front.reference);
         vkCmdSetStencilReference(command, VK_STENCIL_FACE_BACK_BIT,
                                  v.stencil_back.reference);
+        // These commands and states are required by core Vulkan 1.3, below our 1.4 floor.
+        vkCmdSetDepthTestEnable(command, v.depth_test);
+        vkCmdSetDepthWriteEnable(command, v.depth_write);
+        vkCmdSetDepthCompareOp(command, v.depth_compare);
+        vkCmdSetStencilTestEnable(command, v.stencil_test);
+        vkCmdSetStencilOp(command, VK_STENCIL_FACE_FRONT_BIT, v.stencil_front.failOp,
+                          v.stencil_front.passOp, v.stencil_front.depthFailOp,
+                          v.stencil_front.compareOp);
+        vkCmdSetStencilOp(command, VK_STENCIL_FACE_BACK_BIT, v.stencil_back.failOp,
+                          v.stencil_back.passOp, v.stencil_back.depthFailOp,
+                          v.stencil_back.compareOp);
+        vkCmdSetCullMode(command, v.cull_mode);
+        vkCmdSetFrontFace(command, v.front_face);
+        vkCmdSetPrimitiveTopology(command, v.topology);
+        vkCmdSetPrimitiveRestartEnable(command, v.primitive_restart);
     };
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {

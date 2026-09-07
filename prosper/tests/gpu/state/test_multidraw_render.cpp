@@ -256,6 +256,67 @@ int main() {
               "pipeline-cache disable A/B bypasses every lookup");
     }
 
+    // Core dynamic state changes must reuse ONE pipeline and still change coverage. The priming
+    // draw is culled completely, so only the second draw can colour the center. It also retains
+    // the depth attachment when the second draw disables depth, testing the mixed-enable pass.
+    {
+        ResolvedPipelineState prime = opaque;
+        prime.depth_test_enable = true;
+        prime.depth_compare_op = VK_COMPARE_OP_ALWAYS;
+        // Keep the attachment format D32+S8 in every arm; switching D32 to D32+S8 is a valid
+        // pipeline compatibility difference even when stencil operations themselves are dynamic.
+        prime.stencil_enable = true;
+        prime.stencil_compare_op[0] = prime.stencil_compare_op[1] = VK_COMPARE_OP_ALWAYS;
+        prime.cull_mode = VK_CULL_MODE_FRONT_AND_BACK;
+        prosper::test::BackendDraw d;
+        d.vs = vs; d.fs = red; d.ps = &prime; d.vcount = 3;
+        CHECK(!prosper::test::render_draws_rgba({d}, W, H).empty(),
+              "warm the shared depth/stencil pipeline");
+        for (unsigned axis = 0; axis < 10; ++axis) {
+            ResolvedPipelineState state = prime;
+            state.cull_mode = VK_CULL_MODE_NONE;
+            bool visible = true;
+            switch (axis) {
+            case 0: state.depth_test_enable = false; state.stencil_enable = false; break;
+            case 1: state.depth_write_enable = true; break;
+            case 2: state.depth_compare_op = VK_COMPARE_OP_NEVER; visible = false; break;
+            case 3:
+                state.stencil_enable = true;
+                state.stencil_compare_op[0] = state.stencil_compare_op[1] = VK_COMPARE_OP_NEVER;
+                visible = false;
+                break;
+            case 4:
+                state.stencil_enable = true;
+                for (unsigned face = 0; face < 2; ++face) {
+                    state.stencil_compare_op[face] = VK_COMPARE_OP_ALWAYS;
+                    state.stencil_fail_op[face] = VK_STENCIL_OP_REPLACE;
+                    state.stencil_pass_op[face] = VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+                    state.stencil_depth_fail_op[face] = VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+                }
+                break;
+            case 5: state.cull_mode = VK_CULL_MODE_FRONT_AND_BACK; visible = false; break;
+            case 6: state.front_face = VK_FRONT_FACE_CLOCKWISE; break;
+            case 7: state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+            case 8: state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+            default: break; // restore all defaults after the preceding changes
+            }
+            auto changed = d; changed.ps = &state;
+            const auto pixels = prosper::test::render_draws_rgba({d, changed}, W, H);
+            const auto cache = prosper::test::backend_pipeline_cache_stats();
+            printf("  dynamic-state axis %u\n", axis);
+            CHECK(cache.references == 2 && cache.hits == 2 && cache.misses == 0,
+                  "depth/stencil/cull/topology values reuse the warmed pipeline");
+            CHECK(pixels.size() == static_cast<size_t>(W) * H * 4,
+                  "dynamic state render produced a complete frame");
+            if (const auto* c = center(pixels))
+                CHECK((c[0] > 0xC0) == visible,
+                      "cached pipeline honours the current draw's coverage state");
+        }
+        CHECK(prosper::test::pipeline_topology_class(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) !=
+                  prosper::test::pipeline_topology_class(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
+              "line and triangle classes cannot alias on restricted dynamic-topology devices");
+    }
+
     // Hundreds of Evergate draws repeat identical constant/vertex payloads and descriptor contracts.
     // A synchronous backend call may share those immutable objects after exact comparison, while the
     // disable switch provides a byte-identical one-object-per-reference control.
