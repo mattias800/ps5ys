@@ -3063,6 +3063,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_multidraw_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME multidraw_render COMMAND test_multidraw_render)
 
+      add_executable(test_renderer_uint_copy tests/gpu/execute/test_renderer_uint_copy.cpp)
+      target_include_directories(test_renderer_uint_copy PRIVATE tests frontends)
+      target_link_libraries(test_renderer_uint_copy PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+      add_test(NAME renderer_uint_copy COMMAND test_renderer_uint_copy)
+
       # #3180: a failed color-target vkCreateImage must name its site and the real VkResult. Same
       # block as the other render_runner.h tests -- it needs the `tests` and `frontends` include
       # roots and a real Vulkan device.

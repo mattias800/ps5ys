@@ -3301,6 +3301,11 @@ struct BoundImage {
     VkImage depth_bits_image = VK_NULL_HANDLE;
     VkFormat depth_bits_format = VK_FORMAT_UNDEFINED;
     uint32_t depth_bits_saved_layout = 0;
+    // RGBA8 UNORM -> UINT preserves the CPU snapshot's bytes, but must sample an INTEGER
+    // image. Copy into an owned UINT image; no mutable image or mismatched UNORM view is needed.
+    bool color_bits_source = false;
+    VkImage color_bits_image = VK_NULL_HANDLE;
+    uint32_t color_bits_saved_layout = 0;
     VkFormat imported_format = VK_FORMAT_UNDEFINED;
     prosper::gpu::LiveTargetPixelFormat imported_pixel_format =
         prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
@@ -5914,7 +5919,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
-            if (images[i].imported || images[i].depth_bits_source)
+            if (images[i].imported || images[i].depth_bits_source || images[i].color_bits_source)
                 release_live_render_target_image(images[i].imported_addr);
             if (images[i].alias_of != SIZE_MAX) continue;
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
@@ -6665,6 +6670,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               format_float_sampling && unorm_rtt_value_reuse_enabled);
                     const bool compatible_device =
                         import.device == static_cast<void*>(ctx.device);
+                    const bool color_bits_copy = ordinary_2d_view && !depth_import &&
+                        compatible_device && import.transfer_src &&
+                        import.width == r->width && import.height == r->height &&
+                        import.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                        r->format == DataFormat::Uint8 && r->num_components == 4 &&
+                        image_descriptors[i].image_numeric_class == SpirvImageNumericClass::Uint;
                     const bool direct_extent =
                         prosper::frontend::rtt_direct_import_compatible(
                             bi.storage, r->width, r->height, import.width, import.height,
@@ -6673,7 +6684,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // transfer below copies exact texels and deliberately performs no resampling.
                     const bool depth_bits_extent =
                         import.width == r->width && import.height == r->height;
-                    if (compatible_format && direct_extent && compatible_device &&
+                    if (color_bits_copy) {
+                        bi.color_bits_source = true;
+                        bi.color_bits_image = static_cast<VkImage>(import.image);
+                        bi.color_bits_saved_layout = import.layout;
+                        bi.imported_addr = r->gpu_addr;
+                        bi.imported_width = import.width;
+                        bi.imported_height = import.height;
+                    } else if (compatible_format && direct_extent && compatible_device &&
                         (!depth_bits_import_eligible || !depth_import || depth_bits_extent)) {
                         if (depth_import && depth_bits_import_eligible) {
                             bi.depth_bits_source = true;
@@ -6824,7 +6842,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     break;
                 }
             }
-            if (renderer_owned && !bi.imported && !bi.seed_skip &&
+            if (renderer_owned && !bi.imported && !bi.color_bits_source && !bi.seed_skip &&
                 bi.seed_from_imported == SIZE_MAX) {
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
@@ -6979,6 +6997,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool same_backing_representation =
                     prior.imported == bi.imported &&
                     prior.depth_bits_source == bi.depth_bits_source &&
+                    prior.color_bits_source == bi.color_bits_source &&
+                    (!bi.color_bits_source || prior.color_bits_image == bi.color_bits_image) &&
                     prior.unorm_rtt_value_reuse == bi.unorm_rtt_value_reuse &&
                     (!bi.imported ||
                      (prior.image == bi.image &&
@@ -7243,7 +7263,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::getenv("PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS") != nullptr;
             static const bool sampled_dcc_fast_clear_disabled =
                 std::getenv("PROSPER_NO_COMPUTE_DCC_FAST_CLEAR") != nullptr;
-            if (!bi.depth_bits_source && compute_sampled_guest_prepare_required(
+            if (!bi.depth_bits_source && !bi.color_bits_source &&
+                compute_sampled_guest_prepare_required(
                     bi.storage, renderer_owned, bi.imported,
                     imported_guest_bypass_disabled)) {
                 // Resolve and validate the guest source before allocating staging. A proven cache
@@ -7639,14 +7660,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // directly. The old path first built a heap upload and then memcpy'd the complete result
             // here -- an extra 132 MiB CPU pass for Astro Bot's 4K RGBA32 storage representation.
             ScopedMappedMemory upload_mapping(ctx);
-            const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.seed_skip ||
+            const size_t upload_size = (bi.imported || bi.depth_bits_source || bi.color_bits_source ||
+                                        bi.seed_skip ||
                                         bi.seed_from_imported != SIZE_MAX ||
                                         bi.compute_transfer_seed_borrowed)
                 ? size_t{0} : (size_t)sbytes;
             // A retained storage image still needs a fresh destination for its post-dispatch
             // transfer. Only a read-only sampled cache hit can omit staging altogether.
             const auto staging_start = ComputeClock::now();
-            if (!bi.imported &&
+            if (!bi.imported && !bi.color_bits_source &&
                 ((bi.storage && !bi.write_skip) || (!bi.compute_transfer_seed_borrowed &&
                                                     !(bi.persistent && bi.upload_skipped)))) {
                 VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -7681,6 +7703,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const auto prepare_upload_start = ComputeClock::now();
             if (bi.imported) {
                 // The renderer's sampled image is the source, so direct imports need no transfer.
+                bi.guest_bytes = 0;
+            } else if (bi.color_bits_source) {
+                // The command buffer copies the exact RGBA8 payload into a UINT image. Avoid
+                // both the lazy renderer readback and the CPU per-channel repacking/upload.
                 bi.guest_bytes = 0;
             } else if (bi.depth_bits_source) {
                 // The command buffer below copies the borrowed D32 depth plane through this
@@ -8676,7 +8702,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (image_timing)
                 std::fprintf(stderr,
                              "[compute-image] code=0x%llx hash=0x%016llx "
-                             "binding=%u class=%s imported=%u addr=0x%llx "
+                             "binding=%u class=%s imported=%u color-bits-copy=%u addr=0x%llx "
                              "persistent=%u allocation-reused=%u upload-skipped=%u "
                              "extent=%ux%ux%u guest=%zu staging=%llu "
                              "normalized=%u texel=%u sampled-float=%u rgba8-reuse=%u "
@@ -8686,6 +8712,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)item.code_addr,
                              (unsigned long long)timing_program_hash, bi.binding,
                              bi.storage ? "storage" : "sampled", bi.imported ? 1u : 0u,
+                             bi.color_bits_source ? 1u : 0u,
                              (unsigned long long)r->gpu_addr,
                              bi.persistent ? 1u : 0u,
                              bi.forced_seed_allocation_reused ? 1u : 0u,
@@ -9134,6 +9161,57 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_general);
+                continue;
+            }
+            if (bi.color_bits_source) {
+                // vkCmdCopyImage preserves bytes between size-compatible color formats. Unlike
+                // a sampled UNORM view, the destination's RGBA8_UINT view returns 0..255 integers,
+                // exactly as the CPU snapshot path does. No host staging allocation participates.
+                bool source_already_general = false;
+                for (size_t prior = 0; prior < i; ++prior) {
+                    const BoundImage& candidate = images[prior];
+                    if (candidate.imported && candidate.alias_of == SIZE_MAX &&
+                        candidate.image == bi.color_bits_image && imported_barrier_owner(prior))
+                        source_already_general = true;
+                }
+                const VkImageLayout source_saved = source_already_general
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : static_cast<VkImageLayout>(bi.color_bits_saved_layout);
+                VkImageMemoryBarrier barriers[2]{};
+                for (auto& barrier : barriers) {
+                    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex =
+                        VK_QUEUE_FAMILY_IGNORED;
+                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                }
+                barriers[0].image = bi.color_bits_image;
+                barriers[0].oldLayout = source_saved;
+                barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barriers[1].image = bi.image;
+                barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     2, barriers);
+                VkImageCopy copy{};
+                copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.extent = {r->width, r->height, 1};
+                vkCmdCopyImage(command, bi.color_bits_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               bi.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barriers[0].newLayout = source_saved;
+                barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                     2, barriers);
                 continue;
             }
             if (bi.depth_bits_source) {

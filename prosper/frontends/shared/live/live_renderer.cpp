@@ -1518,6 +1518,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             import.device = ctx.dev;
             import.layout = static_cast<uint32_t>(target->layout);
             import.transfer_dst = true;
+            import.transfer_src = true;
             return true;
         },
         [](uint64_t addr) {

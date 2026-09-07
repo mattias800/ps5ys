@@ -1107,6 +1107,8 @@ struct LiveTargetImageImport {
     // Explicit image-creation contract: a sampled import is not otherwise guaranteed to carry
     // VK_IMAGE_USAGE_TRANSFER_DST_BIT, which the compute-result mirror requires.
     bool transfer_dst = false;
+    // A typed color copy may borrow only images created with TRANSFER_SRC usage.
+    bool transfer_src = false;
     bool valid() const { return image && device && width && height; }
 };
 struct LiveTargetImageRequest {
